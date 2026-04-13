@@ -77,7 +77,9 @@ const BLASTER_BULLET_SPEED = 585;
 const BLASTER_BULLET_LIFE = 1.38;
 /** Secondary upgrade: twin shots along current travel vector. */
 const SECONDARY_BULLET_SPEED = 610;
-const SECONDARY_BULLET_LIFE = 1.1;
+const SECONDARY_BULLET_LIFE = 2.2;
+/** Secondary always fires along +X (nose-right), not aim/travel. */
+const SECONDARY_FORWARD_ANGLE = 0;
 const SECONDARY_FIRE_COOLDOWN = 0.17;
 const SECONDARY_PAIR_OFFSET = 9;
 const INVULN_HIT = 1.25;
@@ -108,6 +110,14 @@ const METEOR_SPAWN_INTERVAL_MIN = 2.55;
 const METEOR_SPAWN_INTERVAL_MAX = 4.85;
 const METEOR_MAX_ALIVE = 4;
 const METEOR_DROP_SHIELD_CHANCE = 0.72;
+/** Rare meteor cache: enhanced deflector salvage (burst refill or shave cooldown). */
+const METEOR_DROP_BROWN_DEFLECTOR_CHANCE = 0.065;
+/** Max seconds per burst in brown before cooldown; upgrades raise toward max. */
+const ENHANCED_DEFLECTOR_BURST_START = 3;
+const ENHANCED_DEFLECTOR_BURST_MAX = 20;
+const ENHANCED_DEFLECTOR_BURST_STEP = 2;
+const ENHANCED_DEFLECTOR_SALVAGE_SEC = 3;
+const ENHANCED_DEFLECTOR_COOLDOWN_SEC = 10;
 const METEOR_DROP_POINTS_MIN = 120;
 const METEOR_DROP_POINTS_MAX = 260;
 /** Occasional brown geysers rising from the floor (same damage family as brown walls). */
@@ -127,6 +137,24 @@ const HOSTILE_SPAWN_INTERVAL_MAX = 10.5;
 const HOSTILE_COLLISION_DAMAGE = 30;
 const HOSTILE_BULLET_DAMAGE = 11;
 const HOSTILE_BULLET_SPEED = 340;
+/** Raiders in sector 2+ may spawn with a shield; strength capped at 25% of player max shield (points). */
+const HOSTILE_RAIDER_SHIELD_MAX = MAX_SHIELD * 0.25;
+const HOSTILE_RAIDER_SHIELD_CHANCE = 0.42;
+/** Smart missile damage to raiders (shield absorbs first). */
+const SMART_MISSILE_HOSTILE_DAMAGE = 38;
+/** Isolated stationary hostile platform (sector 2+). */
+const HOSTILE_STATION_MAX_ALIVE = 1;
+const HOSTILE_STATION_SPAWN_INTERVAL_MIN = 15;
+const HOSTILE_STATION_SPAWN_INTERVAL_MAX = 28;
+const HOSTILE_STATION_BODY_HP = 62;
+const HOSTILE_STATION_COLLISION_DAMAGE = 38;
+/** Max station shield points (~half of raider cap). */
+const HOSTILE_STATION_SHIELD_MAX = HOSTILE_RAIDER_SHIELD_MAX * 0.5;
+const HOSTILE_STATION_FIRE_INTERVAL = 1.12;
+const HOSTILE_STATION_BULLET_SPEED = 300;
+/** +20% vs prior 11. */
+const HOSTILE_STATION_BULLET_DAMAGE = 13;
+const HOSTILE_STATION_ISOLATION_PAD = 150;
 /** While shield is up, incoming damage is multiplied by this (mystery “enhanced shields”). */
 const ENHANCED_SHIELD_DAMAGE_MULT = 0.66;
 const DEFLECTOR_MIN_SHIELD = 10;
@@ -233,6 +261,9 @@ const game = {
   gasBlastTimer: 0,
   /** Opposing starfighters (classic skin, nose −X). */
   hostiles: [],
+  /** Stationary gun platforms with red shields (sector 2+). */
+  hostileStations: [],
+  hostileStationSpawnTimer: 0,
   enemyBullets: [],
   hostileSpawnTimer: 0,
   /** Mystery: homing “smart missiles” while holding fire; `smartMissileFireAcc` counts seconds held. */
@@ -244,6 +275,11 @@ const game = {
   enhancedShields: false,
   /** Mystery: purple clouds no longer damage the hull/shield. */
   hasDeflector: false,
+  /** Brown tunnel: burst protection then cooldown (separate from purple-cloud `hasDeflector`). */
+  hasEnhancedDeflector: false,
+  enhancedDeflectorBurstMax: ENHANCED_DEFLECTOR_BURST_START,
+  enhancedDeflectorBurstLeft: 0,
+  enhancedDeflectorCooldown: 0,
   paused: false,
   started: false,
   lastTs: 0,
@@ -332,11 +368,19 @@ function getMovementInputAxes() {
   return { ix, iy };
 }
 
-/** Aim follows held movement keys; default +X (nose-right). */
-function getBlasterAimAngleFromControls() {
+/**
+ * Blaster / secondary / seekers: keys aim first; if coasting with no input, aim matches velocity
+ * so backward flight still shoots aft without holding the strafe key every frame.
+ */
+function getPlayerShotAimAngle() {
   const { ix, iy } = getMovementInputAxes();
-  if (ix === 0 && iy === 0) return 0;
-  return Math.atan2(iy, ix);
+  if (ix !== 0 || iy !== 0) return Math.atan2(iy, ix);
+  const p = game.player;
+  if (p) {
+    const speed = Math.hypot(p.vx, p.vy);
+    if (speed >= 18) return Math.atan2(p.vy, p.vx);
+  }
+  return 0;
 }
 
 function mulberry32(seed) {
@@ -630,6 +674,8 @@ function buildLevel(sector) {
   game.gasBlastTimer = randf(GAS_BLAST_SPAWN_MIN, GAS_BLAST_SPAWN_MAX);
   game.bullets = [];
   game.hostiles = [];
+  game.hostileStations = [];
+  game.hostileStationSpawnTimer = randf(HOSTILE_STATION_SPAWN_INTERVAL_MIN, HOSTILE_STATION_SPAWN_INTERVAL_MAX);
   game.enemyBullets = [];
   game.hostileSpawnTimer = randf(HOSTILE_SPAWN_INTERVAL_MIN, HOSTILE_SPAWN_INTERVAL_MAX);
   game.smartMissiles = [];
@@ -662,17 +708,19 @@ function spawnMysteryAhead() {
   });
 }
 
-/** Blaster, hull, immunity, shield, smart missiles, enhanced shields, deflector, or secondary. */
+/** Blaster, hull, immunity, shield, smart missiles, enhanced shields, deflector, secondary, enhanced deflector. */
 function rollMysteryPowerupKind() {
   const r = Math.random();
-  if (r < 0.23) return 0;
-  if (r < 0.39) return 1;
-  if (r < 0.53) return 2;
-  if (r < 0.67) return 3;
-  if (r < 0.78) return 4;
-  if (r < 0.87) return 5;
-  if (r < 0.94) return 6;
-  return 7;
+  if (r < 0.22) return 0;
+  if (r < 0.37) return 1;
+  if (r < 0.51) return 2;
+  if (r < 0.65) return 3;
+  if (r < 0.76) return 4;
+  if (r < 0.85) return 5;
+  if (r < 0.91) return 6;
+  if (r < 0.925) return 7;
+  if (r < 0.965) return 8;
+  return 9;
 }
 
 function absorbDamage(amount) {
@@ -701,18 +749,14 @@ function isBlasterFireHeld() {
 }
 
 function getTravelAimAngle() {
-  const p = game.player;
-  if (!p) return getBlasterAimAngleFromControls();
-  const speed = Math.hypot(p.vx, p.vy);
-  if (speed >= 40) return Math.atan2(p.vy, p.vx);
-  return getBlasterAimAngleFromControls();
+  return getPlayerShotAimAngle();
 }
 
 function fireSecondaryVolley() {
   if (!game.started || game.gameOver || game.paused || game.won) return;
   if (!game.hasSecondaryWeapon || game.secondaryCooldown > 0 || !game.player) return;
   const p = game.player;
-  const ang = getTravelAimAngle();
+  const ang = SECONDARY_FORWARD_ANGLE;
   const nx = Math.cos(ang + Math.PI * 0.5);
   const ny = Math.sin(ang + Math.PI * 0.5);
   const fx = Math.cos(ang);
@@ -727,7 +771,7 @@ function fireSecondaryVolley() {
       vy: fy * SECONDARY_BULLET_SPEED,
       radius: 5.2,
       life: SECONDARY_BULLET_LIFE,
-      damage: 2,
+      damage: 4,
       kind: "secondary",
     });
   };
@@ -775,6 +819,93 @@ function brownGasDamageFromPenetration(penPx, bandThickness, p) {
   return CLOUD_DAMAGE + (BROWN_GAS_DEEP - CLOUD_DAMAGE) * t;
 }
 
+function playerOverlappingBrownGas(p) {
+  for (const gw of game.gasWalls) {
+    const insetX = gw.w * 0.18;
+    const insetY = gw.h * 0.18;
+    const cx = gw.x + insetX;
+    const cy = gw.y + insetY;
+    const cw = gw.w - insetX * 2;
+    const ch = gw.h - insetY * 2;
+    if (p.x + p.r > cx && p.x - p.r < cx + cw && p.y + p.r > cy && p.y - p.r < cy + ch) return true;
+  }
+  for (const gb of game.gasBlasts) {
+    const yTop = gb.yBase - gb.rise;
+    if (gb.rise < 10) continue;
+    const insetX = gb.w * 0.16;
+    const insetY = Math.min(gb.rise * 0.14, 24);
+    const cx = gb.x + insetX;
+    const cy = yTop + insetY;
+    const cw = gb.w - insetX * 2;
+    const ch = gb.rise - insetY * 2;
+    if (ch < 8) continue;
+    if (p.x + p.r > cx && p.x - p.r < cx + cw && p.y + p.r > cy && p.y - p.r < cy + ch) return true;
+  }
+  return false;
+}
+
+function applyEnhancedDeflectorFuelPickup() {
+  if (!game.hasEnhancedDeflector) {
+    game.hasEnhancedDeflector = true;
+    game.enhancedDeflectorBurstMax = ENHANCED_DEFLECTOR_BURST_START;
+    game.enhancedDeflectorBurstLeft = game.enhancedDeflectorBurstMax;
+    game.enhancedDeflectorCooldown = 0;
+    addOverlay("Enhanced deflector online", "#d4a574");
+    statusEl.textContent = "Salvage: enhanced deflector — protected bursts in brown, then cooldown.";
+    return;
+  }
+  if (game.enhancedDeflectorCooldown > 0) {
+    game.enhancedDeflectorCooldown = Math.max(0, game.enhancedDeflectorCooldown - ENHANCED_DEFLECTOR_SALVAGE_SEC);
+    addOverlay(`Enhanced deflector · −${ENHANCED_DEFLECTOR_SALVAGE_SEC}s cooldown`, "#d4a574");
+  } else {
+    game.enhancedDeflectorBurstLeft = Math.min(
+      game.enhancedDeflectorBurstMax,
+      game.enhancedDeflectorBurstLeft + ENHANCED_DEFLECTOR_SALVAGE_SEC
+    );
+    addOverlay(`Enhanced deflector +${ENHANCED_DEFLECTOR_SALVAGE_SEC}s burst`, "#d4a574");
+  }
+}
+
+function applyEnhancedDeflectorBurstCapUpgrade() {
+  if (!game.hasEnhancedDeflector) {
+    applyEnhancedDeflectorFuelPickup();
+    return;
+  }
+  if (game.enhancedDeflectorBurstMax >= ENHANCED_DEFLECTOR_BURST_MAX) {
+    if (game.enhancedDeflectorCooldown > 0) {
+      game.enhancedDeflectorCooldown = Math.max(0, game.enhancedDeflectorCooldown - ENHANCED_DEFLECTOR_SALVAGE_SEC);
+      addOverlay(`Enhanced deflector · −${ENHANCED_DEFLECTOR_SALVAGE_SEC}s cooldown`, "#d4a574");
+    } else {
+      game.enhancedDeflectorBurstLeft = Math.min(
+        game.enhancedDeflectorBurstMax,
+        game.enhancedDeflectorBurstLeft + ENHANCED_DEFLECTOR_SALVAGE_SEC
+      );
+      addOverlay(`Enhanced deflector +${ENHANCED_DEFLECTOR_SALVAGE_SEC}s burst`, "#d4a574");
+    }
+    return;
+  }
+  game.enhancedDeflectorBurstMax = Math.min(
+    ENHANCED_DEFLECTOR_BURST_MAX,
+    game.enhancedDeflectorBurstMax + ENHANCED_DEFLECTOR_BURST_STEP
+  );
+  game.enhancedDeflectorBurstLeft = Math.min(
+    game.enhancedDeflectorBurstMax,
+    game.enhancedDeflectorBurstLeft + 1
+  );
+  addOverlay(`Enhanced deflector · ${game.enhancedDeflectorBurstMax}s burst cap`, "#e8c89a");
+}
+
+function spawnBrownDeflectorOrb(x, y, salvageKind) {
+  game.mysteries.push({
+    x: clamp(x, 22, game.levelWidth - 22),
+    y: clamp(y, 22, WORLD.height - 22),
+    radius: 11,
+    color: salvageKind === "upgrade" ? "#d4a85c" : "#b87333",
+    kind: "brownDeflectorOrb",
+    salvageKind,
+  });
+}
+
 /** Shipwreck-style: score ticks add shield only up to `SHIELD_REGEN_CAP` after first shield orb. */
 function applyShieldRegenFromScoreDelta(dScore) {
   if (dScore <= 0 || !game.shieldScoreRegenUnlocked || game.shield >= SHIELD_REGEN_CAP) return;
@@ -800,6 +931,7 @@ function applyMapScrollAndCull(dt) {
   for (const ex of game.mineExplosions) ex.x -= dx;
   for (const b of game.bullets) b.x -= dx;
   for (const h of game.hostiles) h.x -= dx;
+  for (const st of game.hostileStations) st.x -= dx;
   for (const eb of game.enemyBullets) eb.x -= dx;
   for (const sm of game.smartMissiles) sm.x -= dx;
 
@@ -815,6 +947,7 @@ function applyMapScrollAndCull(dt) {
   game.mineExplosions = game.mineExplosions.filter((ex) => ex.x + ex.baseR * 4 > ax - cullPad);
   game.bullets = game.bullets.filter((b) => b.x + b.radius > ax - cullPad);
   game.hostiles = game.hostiles.filter((h) => h.x + h.r > ax - cullPad);
+  game.hostileStations = game.hostileStations.filter((st) => st.x + st.r * 1.4 > ax - cullPad);
   game.enemyBullets = game.enemyBullets.filter((eb) => eb.x + eb.radius > ax - cullPad);
 
   const maxCam = Math.max(0, game.levelWidth - WORLD.width);
@@ -952,6 +1085,20 @@ function applyMysteryPowerup() {
       statusEl.textContent = "Mystery prize: secondary twin cannons (G)!";
       addOverlay("POWERUP: Secondary x2", "#ffe08a");
     }
+  } else if (roll === 8) {
+    applyEnhancedDeflectorFuelPickup();
+    statusEl.textContent = "Mystery prize: enhanced deflector salvage.";
+  } else if (roll === 9) {
+    const beforeHas = game.hasEnhancedDeflector;
+    const maxBefore = game.enhancedDeflectorBurstMax;
+    applyEnhancedDeflectorBurstCapUpgrade();
+    if (!beforeHas) {
+      statusEl.textContent = "Mystery prize: enhanced deflector (coupling).";
+    } else if (game.enhancedDeflectorBurstMax > maxBefore) {
+      statusEl.textContent = "Mystery prize: enhanced deflector — longer brown burst!";
+    } else {
+      statusEl.textContent = "Mystery prize: enhanced deflector salvage.";
+    }
   }
 }
 
@@ -999,6 +1146,20 @@ function updatePlayer(dt) {
   p.y = clamp(p.y, m, WORLD.height - m);
 
   game.invuln = Math.max(0, game.invuln - dt);
+
+  if (game.hasEnhancedDeflector) {
+    if (game.enhancedDeflectorCooldown > 0) {
+      game.enhancedDeflectorCooldown = Math.max(0, game.enhancedDeflectorCooldown - dt);
+      if (game.enhancedDeflectorCooldown <= 0) {
+        game.enhancedDeflectorBurstLeft = game.enhancedDeflectorBurstMax;
+      }
+    } else if (playerOverlappingBrownGas(p) && game.enhancedDeflectorBurstLeft > 0) {
+      game.enhancedDeflectorBurstLeft = Math.max(0, game.enhancedDeflectorBurstLeft - dt);
+      if (game.enhancedDeflectorBurstLeft <= 0) {
+        game.enhancedDeflectorCooldown = ENHANCED_DEFLECTOR_COOLDOWN_SEC;
+      }
+    }
+  }
 
   const canHit = game.invuln <= 0 && game.immunityTimer <= 0;
 
@@ -1070,21 +1231,29 @@ function updatePlayer(dt) {
       const cw = gw.w - insetX * 2;
       const ch = gw.h - insetY * 2;
       if (p.x + p.r > cx && p.x - p.r < cx + cw && p.y + p.r > cy && p.y - p.r < cy + ch) {
-        const pen = brownGasPenetrationPx(gw, p, cy, ch);
-        const brownDmg = brownGasDamageFromPenetration(pen, ch, p);
-        absorbDamage(brownDmg);
-        game.invuln = INVULN_HIT * 0.7;
-        addOverlay("Brown gas!", "#d4a574");
-        const mx = cx + cw * 0.5;
-        const my = cy + ch * 0.5;
-        const nx = p.x - mx;
-        const ny = p.y - my;
-        const nlen = Math.hypot(nx, ny) || 1;
-        p.x = mx + (nx / nlen) * (p.r + Math.min(cw, ch) * 0.35 + 6);
-        p.y = my + (ny / nlen) * (p.r + Math.min(cw, ch) * 0.35 + 6);
-        p.vx *= -0.28;
-        p.vy *= -0.28;
-        if (game.hull <= 0) game.gameOver = true;
+        const brownProt =
+          game.hasEnhancedDeflector &&
+          game.enhancedDeflectorCooldown <= 0 &&
+          game.enhancedDeflectorBurstLeft > 0;
+        if (!brownProt) {
+          const pen = brownGasPenetrationPx(gw, p, cy, ch);
+          const brownDmg = brownGasDamageFromPenetration(pen, ch, p);
+          absorbDamage(brownDmg);
+          game.invuln = INVULN_HIT * 0.7;
+          addOverlay("Brown gas!", "#d4a574");
+          const mx = cx + cw * 0.5;
+          const my = cy + ch * 0.5;
+          const nx = p.x - mx;
+          const ny = p.y - my;
+          const nlen = Math.hypot(nx, ny) || 1;
+          p.x = mx + (nx / nlen) * (p.r + Math.min(cw, ch) * 0.35 + 6);
+          p.y = my + (ny / nlen) * (p.r + Math.min(cw, ch) * 0.35 + 6);
+          p.vx *= -0.28;
+          p.vy *= -0.28;
+          if (game.hull <= 0) game.gameOver = true;
+        } else {
+          game.invuln = INVULN_HIT * 0.15;
+        }
         break;
       }
     }
@@ -1099,21 +1268,29 @@ function updatePlayer(dt) {
       const ch = gb.rise - insetY * 2;
       if (ch < 8) continue;
       if (p.x + p.r > cx && p.x - p.r < cx + cw && p.y + p.r > cy && p.y - p.r < cy + ch) {
-        const pen = clamp(Math.min(p.y + p.r, cy + ch) - Math.max(p.y - p.r, cy), 0, ch);
-        const brownDmg = brownGasDamageFromPenetration(pen, ch, p);
-        absorbDamage(brownDmg);
-        game.invuln = INVULN_HIT * 0.68;
-        addOverlay("Gas plume!", "#d4a574");
-        const mx = cx + cw * 0.5;
-        const my = cy + ch * 0.5;
-        const nx = p.x - mx;
-        const ny = p.y - my;
-        const nlen = Math.hypot(nx, ny) || 1;
-        p.x = mx + (nx / nlen) * (p.r + Math.min(cw, ch) * 0.32 + 6);
-        p.y = my + (ny / nlen) * (p.r + Math.min(cw, ch) * 0.32 + 6);
-        p.vx *= -0.26;
-        p.vy *= -0.26;
-        if (game.hull <= 0) game.gameOver = true;
+        const brownProt =
+          game.hasEnhancedDeflector &&
+          game.enhancedDeflectorCooldown <= 0 &&
+          game.enhancedDeflectorBurstLeft > 0;
+        if (!brownProt) {
+          const pen = clamp(Math.min(p.y + p.r, cy + ch) - Math.max(p.y - p.r, cy), 0, ch);
+          const brownDmg = brownGasDamageFromPenetration(pen, ch, p);
+          absorbDamage(brownDmg);
+          game.invuln = INVULN_HIT * 0.68;
+          addOverlay("Gas plume!", "#d4a574");
+          const mx = cx + cw * 0.5;
+          const my = cy + ch * 0.5;
+          const nx = p.x - mx;
+          const ny = p.y - my;
+          const nlen = Math.hypot(nx, ny) || 1;
+          p.x = mx + (nx / nlen) * (p.r + Math.min(cw, ch) * 0.32 + 6);
+          p.y = my + (ny / nlen) * (p.r + Math.min(cw, ch) * 0.32 + 6);
+          p.vx *= -0.26;
+          p.vy *= -0.26;
+          if (game.hull <= 0) game.gameOver = true;
+        } else {
+          game.invuln = INVULN_HIT * 0.15;
+        }
         break;
       }
     }
@@ -1122,9 +1299,9 @@ function updatePlayer(dt) {
       const rr = p.r + eb.radius;
       if (Math.hypot(p.x - eb.x, p.y - eb.y) < rr) {
         game.enemyBullets.splice(ei, 1);
-        absorbDamage(HOSTILE_BULLET_DAMAGE);
+        absorbDamage(eb.damage ?? HOSTILE_BULLET_DAMAGE);
         game.invuln = INVULN_HIT * 0.52;
-        addOverlay("Incoming fire!", "#ffa8d8");
+        addOverlay(eb.kind === "turret" ? "Station fire!" : "Incoming fire!", "#ffa8d8");
         p.vx *= -0.22;
         p.vy *= -0.22;
         if (game.hull <= 0) game.gameOver = true;
@@ -1142,6 +1319,24 @@ function updatePlayer(dt) {
         addOverlay("Hostile contact!", "#ff9a9a");
         p.vx *= -0.38;
         p.vy *= -0.38;
+        if (game.hull <= 0) game.gameOver = true;
+        break;
+      }
+    }
+    for (let ti = game.hostileStations.length - 1; ti >= 0; ti -= 1) {
+      const st = game.hostileStations[ti];
+      const rr = p.r + st.r * 0.88;
+      if (Math.hypot(p.x - st.x, p.y - st.y) < rr) {
+        absorbCollisionDamage(HOSTILE_STATION_COLLISION_DAMAGE);
+        game.invuln = INVULN_HIT * 0.92;
+        addOverlay("Station ram!", "#ff7a7a");
+        const nx = p.x - st.x;
+        const ny = p.y - st.y;
+        const nlen = Math.hypot(nx, ny) || 1;
+        p.x = st.x + (nx / nlen) * (st.r + p.r + 4);
+        p.y = st.y + (ny / nlen) * (st.r + p.r + 4);
+        p.vx *= -0.32;
+        p.vy *= -0.32;
         if (game.hull <= 0) game.gameOver = true;
         break;
       }
@@ -1170,6 +1365,9 @@ function updatePlayer(dt) {
           game.score += pts;
           addOverlay(`Meteor cache: +${pts} credits`, "#d7b3ff");
         }
+      } else if (t.kind === "brownDeflectorOrb") {
+        if (t.salvageKind === "upgrade") applyEnhancedDeflectorBurstCapUpgrade();
+        else applyEnhancedDeflectorFuelPickup();
       } else {
         applyMysteryPowerup();
       }
@@ -1273,6 +1471,10 @@ function spawnMeteor() {
 }
 
 function spawnMeteorDrop(x, y, r) {
+  if (Math.random() < METEOR_DROP_BROWN_DEFLECTOR_CHANCE) {
+    spawnBrownDeflectorOrb(x, y, "fuel");
+    return;
+  }
   const isShield = Math.random() < METEOR_DROP_SHIELD_CHANCE;
   const t = clamp((r - METEOR_RADIUS_MIN) / (METEOR_RADIUS_MAX - METEOR_RADIUS_MIN), 0, 1);
   game.mysteries.push({
@@ -1341,6 +1543,114 @@ function updateGasBlasts(dt) {
   game.gasBlasts = game.gasBlasts.filter((b) => b.life < b.maxLife);
 }
 
+function addHostileKillScore() {
+  game.score += 28 + Math.min(40, game.level * 4);
+}
+
+/** Returns true if hostile is destroyed. */
+function applyDamageToHostileShieldFirst(h, dmg) {
+  let d = dmg;
+  if (h.shield > 0) {
+    const use = Math.min(h.shield, d);
+    h.shield -= use;
+    d -= use;
+  }
+  h.bodyHp -= d;
+  return h.bodyHp <= 0;
+}
+
+/** Returns true if station hull is destroyed. */
+function applyDamageToHostileStationShieldFirst(st, dmg) {
+  let d = dmg;
+  if (st.shield > 0) {
+    const use = Math.min(st.shield, d);
+    st.shield -= use;
+    d -= use;
+  }
+  st.bodyHp -= d;
+  return st.bodyHp <= 0;
+}
+
+function hostileStationSpawnClear(x, y, rad) {
+  const pad = HOSTILE_STATION_ISOLATION_PAD;
+  for (const h of game.hostiles) {
+    if (Math.hypot(h.x - x, h.y - y) < h.r + rad + pad) return false;
+  }
+  for (const m of game.mines) {
+    if (Math.hypot(m.x - x, m.y - y) < m.radius + rad + pad) return false;
+  }
+  for (const r of game.meteors) {
+    if (Math.hypot(r.x - x, r.y - y) < r.radius + rad + pad) return false;
+  }
+  for (const t of game.mysteries) {
+    if (Math.hypot(t.x - x, t.y - y) < t.radius + rad + pad) return false;
+  }
+  return true;
+}
+
+function spawnHostileStation() {
+  if (game.level < 2 || game.hostileStations.length >= HOSTILE_STATION_MAX_ALIVE) return;
+  const H = WORLD.height;
+  const cam = game.cameraX;
+  const w = WORLD.width;
+  const r = Math.max(34, (game.player?.r ?? 13) * 2.65);
+  for (let attempt = 0; attempt < 14; attempt += 1) {
+    const x = cam + w + randf(320, 620);
+    const y = randf(72, H - 72);
+    if (!hostileStationSpawnClear(x, y, r * 1.35)) continue;
+    const frac = randf(0.1, 1);
+    const shield = Math.min(HOSTILE_STATION_SHIELD_MAX, frac * HOSTILE_STATION_SHIELD_MAX);
+    game.hostileStations.push({
+      x,
+      y,
+      r,
+      bodyHp: HOSTILE_STATION_BODY_HP + Math.min(24, game.level * 3),
+      shield,
+      shootTimer: randf(0.2, 0.85),
+      spin: Math.random() * Math.PI * 2,
+    });
+    return;
+  }
+}
+
+function updateHostileStationSpawns(dt) {
+  if (!game.started || game.gameOver || game.won || game.level < 2) return;
+  game.hostileStationSpawnTimer -= dt;
+  if (game.hostileStationSpawnTimer > 0) return;
+  spawnHostileStation();
+  game.hostileStationSpawnTimer = randf(HOSTILE_STATION_SPAWN_INTERVAL_MIN, HOSTILE_STATION_SPAWN_INTERVAL_MAX);
+}
+
+function updateHostileStations(dt) {
+  const p = game.player;
+  if (!p) return;
+  for (const st of game.hostileStations) {
+    st.shootTimer -= dt;
+    st.spin += dt * 0.35;
+    if (st.shootTimer > 0) continue;
+    const dx = p.x - st.x;
+    const dy = p.y - st.y;
+    const base = Math.atan2(dy, dx);
+    const spreads = [-0.52, -0.26, 0, 0.26, 0.52];
+    for (const off of spreads) {
+      const a = base + off;
+      const bx = Math.cos(a);
+      const by = Math.sin(a);
+      game.enemyBullets.push({
+        x: st.x + bx * (st.r + 10),
+        y: st.y + by * (st.r + 10),
+        vx: bx * HOSTILE_STATION_BULLET_SPEED,
+        vy: by * HOSTILE_STATION_BULLET_SPEED,
+        radius: 3.8,
+        life: 2.5,
+        kind: "turret",
+        damage: HOSTILE_STATION_BULLET_DAMAGE,
+      });
+    }
+    st.shootTimer = HOSTILE_STATION_FIRE_INTERVAL + game.level * 0.012;
+  }
+}
+
 function spawnHostile() {
   if (game.hostiles.length >= HOSTILE_MAX_ALIVE) return;
   const H = WORLD.height;
@@ -1350,6 +1660,11 @@ function spawnHostile() {
   const lvl = game.level;
   const speed = HOSTILE_SEEK_SPEED_BASE + lvl * HOSTILE_SEEK_SPEED_PER_LEVEL + randf(-14, 18);
   const pr = p ? p.r : 13;
+  let shield = 0;
+  if (lvl >= 2 && Math.random() < HOSTILE_RAIDER_SHIELD_CHANCE) {
+    const frac = randf(0.06, 1);
+    shield = Math.min(HOSTILE_RAIDER_SHIELD_MAX, frac * HOSTILE_RAIDER_SHIELD_MAX);
+  }
   game.hostiles.push({
     x: cam + w + randf(36, 200),
     y: randf(52, H - 52),
@@ -1357,7 +1672,8 @@ function spawnHostile() {
     vy: 0,
     r: pr * 0.92,
     speed,
-    hp: 2 + Math.min(2, Math.floor(lvl / 5)),
+    bodyHp: 2 + Math.min(2, Math.floor(lvl / 5)),
+    shield,
     shootTimer: randf(0.35, 1.15),
     strafePhase: Math.random() * Math.PI * 2,
   });
@@ -1403,6 +1719,8 @@ function updateHostiles(dt) {
         vy: by * HOSTILE_BULLET_SPEED,
         radius: 3.6,
         life: 2.4,
+        kind: "raider",
+        damage: HOSTILE_BULLET_DAMAGE,
       });
       h.shootTimer = randf(0.75, 1.65) + lvl * 0.025;
     }
@@ -1454,16 +1772,18 @@ function findSmartMissileAimPoint(mx, my, mvx, maxDist) {
   };
   // Prefer targets ahead of current missile travel direction.
   consider(game.hostiles, true);
+  consider(game.hostileStations, true);
   consider(game.mines, true);
   consider(game.meteors, true);
   // Fallback: if nothing forward, allow any direction.
   if (bd >= maxDist) {
     consider(game.hostiles, false);
+    consider(game.hostileStations, false);
     consider(game.mines, false);
     consider(game.meteors, false);
   }
   if (bd < maxDist) return { x: bx, y: by };
-  const ang = getBlasterAimAngleFromControls();
+  const ang = getPlayerShotAimAngle();
   return { x: mx + Math.cos(ang) * 520, y: my + Math.sin(ang) * 520 };
 }
 
@@ -1471,7 +1791,7 @@ function spawnSmartMissile() {
   if (!game.player || !game.hasSmartMissiles) return;
   if (game.smartMissiles.length >= SMART_MISSILE_MAX_ALIVE) return;
   const p = game.player;
-  const ang = getBlasterAimAngleFromControls();
+  const ang = getPlayerShotAimAngle();
   const spd =
     (MINE_SPEED_BASE + game.level * MINE_SPEED_PER_LEVEL + randf(-5, 12)) * SMART_MISSILE_SPEED_MULT;
   game.smartMissiles.push({
@@ -1513,6 +1833,7 @@ function handleSmartMissileHits() {
   if (game.smartMissiles.length === 0) return;
   const aliveS = new Array(game.smartMissiles.length).fill(true);
   const aliveH = new Array(game.hostiles.length).fill(true);
+  const aliveSt = new Array(game.hostileStations.length).fill(true);
   const aliveM = new Array(game.mines.length).fill(true);
   const aliveR = new Array(game.meteors.length).fill(true);
 
@@ -1525,11 +1846,31 @@ function handleSmartMissileHits() {
       if (Math.hypot(s.x - h.x, s.y - h.y) < s.radius + h.r) {
         aliveS[si] = false;
         spawnMineExplosion(s.x, s.y, s.radius);
-        h.hp -= 1;
-        if (h.hp <= 0) {
+        if (applyDamageToHostileShieldFirst(h, SMART_MISSILE_HOSTILE_DAMAGE)) {
           spawnMineExplosion(h.x, h.y, h.r * 0.85);
           aliveH[hi] = false;
-          game.score += 28 + Math.min(40, game.level * 4);
+          addHostileKillScore();
+        }
+        break;
+      }
+    }
+  }
+
+  for (let si = 0; si < game.smartMissiles.length; si += 1) {
+    if (!aliveS[si]) continue;
+    const s = game.smartMissiles[si];
+    for (let ti = 0; ti < game.hostileStations.length; ti += 1) {
+      if (!aliveSt[ti]) continue;
+      const st = game.hostileStations[ti];
+      const hitR = st.shield > 0 ? st.r * 1.34 : st.r;
+      if (Math.hypot(s.x - st.x, s.y - st.y) < s.radius + hitR) {
+        aliveS[si] = false;
+        spawnMineExplosion(s.x, s.y, s.radius);
+        if (applyDamageToHostileStationShieldFirst(st, SMART_MISSILE_HOSTILE_DAMAGE)) {
+          spawnMineExplosion(st.x, st.y, st.r * 1.1);
+          aliveSt[ti] = false;
+          game.score += 52 + Math.min(50, game.level * 5);
+          spawnBrownDeflectorOrb(st.x, st.y, "fuel");
         }
         break;
       }
@@ -1571,6 +1912,7 @@ function handleSmartMissileHits() {
 
   game.smartMissiles = game.smartMissiles.filter((_, i) => aliveS[i]);
   game.hostiles = game.hostiles.filter((_, i) => aliveH[i]);
+  game.hostileStations = game.hostileStations.filter((_, i) => aliveSt[i]);
   game.mines = game.mines.filter((_, i) => aliveM[i]);
   game.meteors = game.meteors.filter((_, i) => aliveR[i]);
 }
@@ -1596,7 +1938,7 @@ function fireBlasterVolley() {
       damage: 1,
     });
   };
-  const ang0 = getBlasterAimAngleFromControls();
+  const ang0 = getPlayerShotAimAngle();
   if (tier === 1) {
     spawnBullet(ang0);
   } else if (tier === 2) {
@@ -1687,11 +2029,10 @@ function handleBulletHostileHits() {
       const rr = b.radius + h.r;
       if (Math.hypot(b.x - h.x, b.y - h.y) < rr) {
         aliveB[bi] = false;
-        h.hp -= b.damage ?? 1;
-        if (h.hp <= 0) {
+        if (applyDamageToHostileShieldFirst(h, b.damage ?? 1)) {
           spawnMineExplosion(h.x, h.y, h.r * 0.85);
           aliveH[hi] = false;
-          game.score += 28 + Math.min(40, game.level * 4);
+          addHostileKillScore();
         }
         break;
       }
@@ -1699,6 +2040,33 @@ function handleBulletHostileHits() {
   }
   game.bullets = game.bullets.filter((_, idx) => aliveB[idx]);
   game.hostiles = game.hostiles.filter((_, idx) => aliveH[idx]);
+}
+
+function handleBulletStationHits() {
+  if (game.bullets.length === 0 || game.hostileStations.length === 0) return;
+  const aliveSt = new Array(game.hostileStations.length).fill(true);
+  const aliveB = new Array(game.bullets.length).fill(true);
+  for (let bi = 0; bi < game.bullets.length; bi += 1) {
+    if (!aliveB[bi]) continue;
+    const b = game.bullets[bi];
+    for (let ti = 0; ti < game.hostileStations.length; ti += 1) {
+      if (!aliveSt[ti]) continue;
+      const st = game.hostileStations[ti];
+      const hitR = st.shield > 0 ? st.r * 1.34 : st.r;
+      if (Math.hypot(b.x - st.x, b.y - st.y) < b.radius + hitR) {
+        aliveB[bi] = false;
+        if (applyDamageToHostileStationShieldFirst(st, b.damage ?? 1)) {
+          spawnMineExplosion(st.x, st.y, st.r * 1.1);
+          aliveSt[ti] = false;
+          game.score += 52 + Math.min(50, game.level * 5);
+          spawnBrownDeflectorOrb(st.x, st.y, "fuel");
+        }
+        break;
+      }
+    }
+  }
+  game.bullets = game.bullets.filter((_, idx) => aliveB[idx]);
+  game.hostileStations = game.hostileStations.filter((_, idx) => aliveSt[idx]);
 }
 
 function spawnMineExplosion(x, y, baseR) {
@@ -1809,6 +2177,11 @@ function drawEffectText() {
   if (game.hasSmartMissiles) effects.push("Smart missiles");
   if (game.enhancedShields) effects.push("Enhanced shields");
   if (game.hasDeflector) effects.push("Deflector");
+  if (game.hasEnhancedDeflector) {
+    const sec =
+      game.enhancedDeflectorCooldown > 0 ? game.enhancedDeflectorCooldown : game.enhancedDeflectorBurstLeft;
+    effects.push(`Enhanced deflector ${sec.toFixed(1)}s`);
+  }
   if (effects.length === 0) return;
   ctx.save();
   ctx.textAlign = "left";
@@ -2036,6 +2409,50 @@ function drawSmartMissilesWorld() {
   }
 }
 
+function drawHostileStationsWorld() {
+  ensureIssStationImg();
+  const t = game.lastTs / 1000;
+  const br = stationBodyRadius();
+  const baseW = stationDrawWidth();
+  for (const st of game.hostileStations) {
+    ctx.save();
+    ctx.translate(st.x, st.y);
+    if (st.shield > 0) {
+      const pulse = 0.72 + 0.28 * Math.sin(t * 2.4 + st.spin);
+      const sr = st.r * 1.32;
+      const grd = ctx.createRadialGradient(0, 0, sr * 0.15, 0, 0, sr);
+      grd.addColorStop(0, `rgba(255, 80, 90, ${0.22 * pulse})`);
+      grd.addColorStop(0.55, `rgba(255, 40, 55, ${0.14 * pulse})`);
+      grd.addColorStop(1, "rgba(180, 20, 40, 0)");
+      ctx.fillStyle = grd;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, sr, sr * 0.92, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    const w = baseW * clamp(st.r / Math.max(8, br), 0.65, 2.35);
+    const aspect =
+      issStationImg && issStationImg.naturalWidth > 0
+        ? issStationImg.naturalHeight / issStationImg.naturalWidth
+        : 0.63;
+    const h = w * aspect;
+    ctx.globalAlpha = 0.9;
+    if (issStationImg && issStationImg.complete && issStationImg.naturalWidth > 0) {
+      ctx.filter = "saturate(1.15) hue-rotate(-8deg)";
+      ctx.drawImage(issStationImg, -w * 0.5, -h * 0.5, w, h);
+      ctx.filter = "none";
+    } else {
+      ctx.fillStyle = "rgba(160, 175, 200, 0.4)";
+      ctx.beginPath();
+      ctx.arc(0, 0, st.r * 0.85, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255, 100, 110, 0.65)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
 function drawHostilesWorld() {
   const img = getHostileShipImage();
   const starOpt = SHIP_SKIN_OPTIONS.find((o) => o.id === "starfighter") ?? { rasterScale: 1 };
@@ -2043,6 +2460,18 @@ function drawHostilesWorld() {
     const bank = clamp(h.vy / MAX_SPEED, -1, 1) * 0.2;
     ctx.save();
     ctx.translate(h.x, h.y);
+    if (h.shield > 0) {
+      const ratio = clamp(h.shield / HOSTILE_RAIDER_SHIELD_MAX, 0, 1);
+      const glowR = h.r * (1.15 + 0.2 * ratio);
+      const grd = ctx.createRadialGradient(0, 0, h.r * 0.2, 0, 0, glowR);
+      grd.addColorStop(0, "rgba(120, 220, 255, 0.2)");
+      grd.addColorStop(0.65, "rgba(80, 180, 255, 0.12)");
+      grd.addColorStop(1, "rgba(40, 120, 200, 0)");
+      ctx.fillStyle = grd;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, glowR, glowR * 0.9, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
     ctx.scale(-1, 1);
     if (img) {
       ctx.rotate(RASTER_SHIP_ROTATION + bank);
@@ -2060,8 +2489,8 @@ function drawHostilesWorld() {
 
 function drawEnemyBulletsWorld() {
   ctx.save();
-  ctx.fillStyle = "#ff6eb4";
   for (const b of game.enemyBullets) {
+    ctx.fillStyle = b.kind === "turret" ? "#ff3d4d" : "#ff6eb4";
     ctx.beginPath();
     ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
     ctx.fill();
@@ -2275,9 +2704,9 @@ function drawMysteriesWorld() {
     ctx.arc(t.x, t.y, t.radius, 0, Math.PI * 2);
     ctx.fill();
     ctx.lineWidth = 2;
-    ctx.strokeStyle = "#f2d6ff";
+    ctx.strokeStyle = t.kind === "brownDeflectorOrb" ? "#f0c080" : "#f2d6ff";
     ctx.stroke();
-    ctx.fillStyle = "#fff4ab";
+    ctx.fillStyle = t.kind === "brownDeflectorOrb" ? "#ffe8c8" : "#fff4ab";
     ctx.beginPath();
     ctx.arc(t.x, t.y, 3.2, 0, Math.PI * 2);
     ctx.fill();
@@ -2307,6 +2736,7 @@ function drawWorld() {
 
   drawMysteriesWorld();
   drawMeteorsWorld();
+  drawHostileStationsWorld();
   drawHostilesWorld();
   drawSmartMissilesWorld();
   drawMinesWorld();
@@ -2467,6 +2897,11 @@ function applyCanvasSize() {
       h.r *= vScale;
       h.speed *= vScale;
     }
+    for (const st of game.hostileStations) {
+      st.x *= sx;
+      st.y *= sy;
+      st.r *= vScale;
+    }
     for (const eb of game.enemyBullets) {
       eb.x *= sx;
       eb.y *= sy;
@@ -2531,6 +2966,10 @@ function resetGame() {
   game.smartMissiles = [];
   game.enhancedShields = false;
   game.hasDeflector = false;
+  game.hasEnhancedDeflector = false;
+  game.enhancedDeflectorBurstMax = ENHANCED_DEFLECTOR_BURST_START;
+  game.enhancedDeflectorBurstLeft = 0;
+  game.enhancedDeflectorCooldown = 0;
   game.gameOver = false;
   game.won = false;
   game.invuln = 0;
@@ -2616,6 +3055,8 @@ function frame(ts) {
     updateGasBlasts(dt);
     updateHostileSpawns(dt);
     updateHostiles(dt);
+    updateHostileStationSpawns(dt);
+    updateHostileStations(dt);
     updateEnemyBullets(dt);
     updatePlayer(dt);
     updateMines(dt);
@@ -2625,6 +3066,7 @@ function frame(ts) {
     handleBulletMineHits();
     handleBulletMeteorHits();
     handleBulletHostileHits();
+    handleBulletStationHits();
     updateOverlays(dt);
     updateHud();
     const dScore = game.score - game.prevScoreForShieldRegen;
