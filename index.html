@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#050508" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>Kessel Run — Dodge Run</title>
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div
+      id="loadScreen"
+      class="load-screen"
+      role="status"
+      aria-live="polite"
+      aria-busy="true"
+      aria-label="Loading game assets"
+    >
+      <div class="load-screen-inner">
+        <h1 class="load-title">
+          <span class="load-title-text">KESSEL RUN GAMES</span>
+        </h1>
+        <p class="load-push">LOADING</p>
+        <div class="load-bar-wrap" aria-hidden="true">
+          <div id="loadBar" class="load-bar"></div>
+        </div>
+        <p class="load-wait">PLEASE WAIT</p>
+        <p class="load-copy">HYPERLANE ARCADE · 2026</p>
+      </div>
+    </div>
+    <main class="app">
+      <header class="hud ui-no-start">
+        <div class="hud-stats">
+          <div>Score: <span id="score">0</span></div>
+          <div>Sector: <span id="level">1</span></div>
+          <div>Hull: <span id="hull">100%</span> <span id="shieldHud" hidden>(Shield: 0%)</span></div>
+        </div>
+        <div class="hud-actions">
+          <button id="wikiBtn" class="icon-btn" type="button" aria-label="Open wiki / help">?</button>
+          <button id="settingsBtn" class="icon-btn" type="button" aria-label="Open settings">⚙</button>
+        </div>
+      </header>
+      <div class="canvas-stack">
+        <canvas id="game" width="960" height="640" aria-label="Kessel Run dodge run canvas"></canvas>
+      </div>
+      <section class="controls ui-no-start">
+        <button id="largeModeBtn" type="button">Large Mode: On</button>
+        <button id="restart" type="button">Restart</button>
+      </section>
+      <section id="mobileControls" class="mobile-controls ui-no-start" aria-label="Mobile controls" hidden>
+        <div class="mobile-dpad" aria-label="Direction pad">
+          <button id="mobileDpadUpBtn" class="dpad-btn dpad-up" type="button">▲</button>
+          <button id="mobileLeftBtn" class="dpad-btn dpad-left" type="button">◀</button>
+          <button id="mobileDpadCenter" class="dpad-btn dpad-center" type="button" disabled>●</button>
+          <button id="mobileRightBtn" class="dpad-btn dpad-right" type="button">▶</button>
+          <button id="mobileReverseBtn" class="dpad-btn dpad-down" type="button">▼</button>
+        </div>
+        <div class="mobile-actions" aria-label="Action buttons">
+          <div class="mobile-ab">
+            <button id="mobileThrottleBtn" class="ab-btn ab-b" type="button">Up</button>
+            <button id="mobileFireBtn" class="ab-btn ab-a" type="button">Down</button>
+          </div>
+          <div class="mobile-meta">
+            <button id="mobilePauseBtn" type="button">Pause</button>
+          </div>
+        </div>
+      </section>
+      <p id="status" class="status">Auto-scroll run — purple nebulae, brown gas mazes, mines, mystery orbs (blaster).</p>
+    </main>
+
+    <div id="wikiBackdrop" class="wiki-overlay-backdrop ui-no-start" hidden></div>
+    <aside
+      id="wikiPanel"
+      class="wiki-overlay-panel ui-no-start"
+      aria-label="Dodge run help"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="wikiTitle"
+      tabindex="-1"
+      hidden
+    >
+      <div class="settings-header wiki-overlay-header">
+        <h2 id="wikiTitle">Wiki</h2>
+        <button id="wikiCloseBtn" class="icon-btn" type="button" aria-label="Close wiki (Escape)">✕</button>
+      </div>
+      <div class="settings-body wiki-body">
+        <section class="wiki-section">
+          <h3 class="wiki-section-title">What’s the goal?</h3>
+          <p>
+            Long sectors: the <strong>whole map moves</strong> past you (your ship isn’t auto-shoved forward). The
+            <strong>camera follows the scroll</strong>, not your ship — you maneuver inside a slowly drifting window. You can’t
+            fly past the back of the screen; it’s a <strong>soft wall</strong> (no hull damage). Content that has scrolled off
+            to the left is gone.
+            <strong>Purple nebula</strong> wisps float in the corridor. <strong>Brown gas</strong> forms a jagged ceiling and floor
+            (shmup-style tunnel) and hurts on contact; mystery orbs stay clear of both. Dodge <strong>homing mines</strong>, grab
+            credits, collect
+            <strong>purple orbs</strong> for hull, shield, immunity, or <strong>blaster upgrades</strong> (you start with tier 1;
+            F / Enter / Insert to fire). Bonus score only if an orb rolls an upgrade you already maxed. Reach the
+            <strong>orbital station</strong> (dock ring) to clear the sector. Ships use your usual skins, drawn sideways.
+          </p>
+        </section>
+        <section class="wiki-section">
+          <h3 class="wiki-section-title">Credits on the route</h3>
+          <ul class="wiki-treasure-row">
+            <li class="wiki-treasure-item"><span class="wiki-dot wiki-dot--10" aria-hidden="true"></span> 10 pts</li>
+            <li class="wiki-treasure-item"><span class="wiki-dot wiki-dot--25" aria-hidden="true"></span> 25 pts</li>
+            <li class="wiki-treasure-item"><span class="wiki-dot wiki-dot--50" aria-hidden="true"></span> 50 pts</li>
+            <li class="wiki-treasure-item"><span class="wiki-dot wiki-dot--100" aria-hidden="true"></span> 100 pts</li>
+          </ul>
+        </section>
+        <section class="wiki-section">
+          <h3 class="wiki-section-title">Hazards &amp; pickups</h3>
+          <p>
+            <strong>Mines</strong> home toward you; they match the classic cyan body / red spike art. <strong>Purple nebula</strong>
+            and <strong>brown gas</strong> (ceiling/floor tunnel) are gaseous hazards (brown is a bit meaner). <strong>Shield</strong>
+            (from purple orbs) eats damage before hull; after your first shield pickup, <strong>score slowly refills shield</strong> up
+            to 100% (orbs can still push higher toward 200%). You always have a <strong>blaster</strong>; orbs upgrade spread/aft. Other orbs
+            repair hull, extend immunity, or raise shield — never a standalone “bonus credits” prize (credits only when that buff
+            is already maxed). <strong>0% hull</strong> ends the run.
+          </p>
+        </section>
+        <section class="wiki-section">
+          <h3 class="wiki-section-title">Controls</h3>
+          <p>
+            <strong>WASD</strong> or arrow keys to thrust in any direction. <strong>Space</strong> pauses. <strong>F</strong>,
+            <strong>Enter</strong>, or <strong>Insert</strong> fires the blaster (on from the start; orbs upgrade it). After a sector
+            clear, <strong>Space</strong> or tap continues. On touch: D-pad for left/right/up/down; extra Up/Down buttons match W/S.
+          </p>
+        </section>
+      </div>
+    </aside>
+
+    <div id="settingsBackdrop" class="settings-backdrop ui-no-start" hidden></div>
+    <aside id="settingsPanel" class="settings-panel ui-no-start" aria-label="Game settings" hidden>
+      <div class="settings-header">
+        <h2>Settings</h2>
+        <button id="settingsCloseBtn" class="icon-btn" type="button" aria-label="Close settings (Escape)">✕</button>
+      </div>
+      <div class="settings-body">
+        <p class="settings-controls-title">Controls</p>
+        <p>WASD or arrows — fly in any direction</p>
+        <p>Space — pause (or next sector after a clear)</p>
+        <p>F / Enter / Insert — fire blaster (tier 1 from start; orbs upgrade)</p>
+        <p>Large mode enlarges the canvas on desktop; restart applies “Start sector” below.</p>
+
+        <label class="settings-field" for="shipSkinSelect">
+          <span class="settings-field-label">Ship (side view)</span>
+          <select id="shipSkinSelect" aria-label="Ship appearance"></select>
+        </label>
+
+        <label class="toggle">
+          Start sector (difficulty)
+          <input id="startLevelInput" type="number" min="1" max="99" value="1" />
+        </label>
+        <div class="settings-actions">
+          <button id="startAtBtn" type="button">Start At</button>
+          <button id="installBtn" type="button" hidden>Install App</button>
+        </div>
+      </div>
+    </aside>
+    <script src="./game.js"></script>
+  </body>
+</html>
