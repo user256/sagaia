@@ -129,6 +129,9 @@ const HOSTILE_BULLET_DAMAGE = 11;
 const HOSTILE_BULLET_SPEED = 340;
 /** While shield is up, incoming damage is multiplied by this (mystery “enhanced shields”). */
 const ENHANCED_SHIELD_DAMAGE_MULT = 0.66;
+const DEFLECTOR_MIN_SHIELD = 10;
+const LOW_SHIELD_COLLISION_CHIP_THRESHOLD = 50;
+const LOW_SHIELD_COLLISION_CHIP_DAMAGE = 1;
 /** Friendly homing seekers spawned from sustained firing (mystery upgrade). */
 const SMART_MISSILE_MAX_ALIVE = 6;
 /** Seconds of holding fire between seekers (halved vs original 5–10 for parity with faster shield regen). */
@@ -686,6 +689,13 @@ function absorbDamage(amount) {
   game.hull -= a - fromShield;
 }
 
+function absorbCollisionDamage(amount) {
+  absorbDamage(amount);
+  if (game.shield < LOW_SHIELD_COLLISION_CHIP_THRESHOLD) {
+    game.hull -= LOW_SHIELD_COLLISION_CHIP_DAMAGE;
+  }
+}
+
 function isBlasterFireHeld() {
   return !!(KEY.KeyF || KEY.Insert || KEY.Enter);
 }
@@ -999,7 +1009,7 @@ function updatePlayer(dt) {
       if (Math.hypot(p.x - h.x, p.y - h.y) < rr) {
         spawnMineExplosion(h.x, h.y, h.radius);
         game.mines.splice(mi, 1);
-        absorbDamage(MINE_DAMAGE);
+        absorbCollisionDamage(MINE_DAMAGE);
         game.invuln = INVULN_HIT;
         addOverlay("Mine hit!", "#ff7a7a");
         p.vx *= -0.4;
@@ -1015,7 +1025,7 @@ function updatePlayer(dt) {
         spawnMineExplosion(r.x, r.y, r.radius);
         game.meteors.splice(ri, 1);
         spawnMeteorDrop(r.x, r.y, r.radius);
-        absorbDamage(r.damage ?? METEOR_DAMAGE_MIN);
+        absorbCollisionDamage(r.damage ?? METEOR_DAMAGE_MIN);
         game.invuln = INVULN_HIT;
         addOverlay("Meteor strike!", "#e8c89a");
         p.vx *= -0.35;
@@ -1032,7 +1042,7 @@ function updatePlayer(dt) {
       const cw = cl.w - insetX * 2;
       const ch = cl.h - insetY * 2;
       if (p.x + p.r > cx && p.x - p.r < cx + cw && p.y + p.r > cy && p.y - p.r < cy + ch) {
-        if (!game.hasDeflector) {
+        if (!(game.hasDeflector && game.shield >= DEFLECTOR_MIN_SHIELD)) {
           const nebulaDmg =
             game.shield > 0 ? CLOUD_DAMAGE * CLOUD_DAMAGE_WITH_SHIELD_MULT : CLOUD_DAMAGE;
           absorbDamage(nebulaDmg);
@@ -1127,7 +1137,7 @@ function updatePlayer(dt) {
       if (Math.hypot(p.x - h.x, p.y - h.y) < rr) {
         spawnMineExplosion(h.x, h.y, h.r);
         game.hostiles.splice(hi, 1);
-        absorbDamage(HOSTILE_COLLISION_DAMAGE);
+        absorbCollisionDamage(HOSTILE_COLLISION_DAMAGE);
         game.invuln = INVULN_HIT;
         addOverlay("Hostile contact!", "#ff9a9a");
         p.vx *= -0.38;
@@ -2132,7 +2142,54 @@ function drawCheckpointStation() {
   ctx.restore();
 }
 
-/** Shield + immunity rings (Shipwreck `drawPlayer` logic), with pulse on shield. */
+function drawShipThrusterWorld(p, bank) {
+  const t = game.lastTs * 0.001;
+  const pressingRight = !!(KEY.KeyD || KEY.ArrowRight);
+  if (!pressingRight) return;
+  const speedT = clamp(Math.hypot(p.vx, p.vy) / MAX_SPEED, 0, 1);
+  const flameT = 0.8 + speedT * 0.35;
+  const baseLen = p.r * (0.7 + flameT * 0.85);
+  const flicker = 1 + Math.sin(t * 28) * 0.16 + Math.cos(t * 17) * 0.07;
+  const len = baseLen * flicker;
+
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(bank);
+
+  // Soft plume glow.
+  ctx.globalCompositeOperation = "screen";
+  const plume = ctx.createRadialGradient(-p.r * 1.05, 0, p.r * 0.08, -p.r * 1.35, 0, p.r * 1.25);
+  plume.addColorStop(0, "rgba(255, 248, 208, 0.55)");
+  plume.addColorStop(0.35, "rgba(255, 166, 86, 0.42)");
+  plume.addColorStop(1, "rgba(255, 80, 24, 0)");
+  ctx.fillStyle = plume;
+  ctx.beginPath();
+  ctx.ellipse(-p.r * 1.2, 0, p.r * 1.05, p.r * 0.7, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Main thrust icon/flame.
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = "#ff8a3a";
+  ctx.beginPath();
+  ctx.moveTo(-p.r * 0.9, 0);
+  ctx.lineTo(-p.r * 1.15, -p.r * 0.22);
+  ctx.lineTo(-p.r * (1.05 + len / p.r), 0);
+  ctx.lineTo(-p.r * 1.15, p.r * 0.22);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.fillStyle = "#fff2ad";
+  ctx.beginPath();
+  ctx.moveTo(-p.r * 0.98, 0);
+  ctx.lineTo(-p.r * 1.12, -p.r * 0.12);
+  ctx.lineTo(-p.r * (1 + len * 0.58 / p.r), 0);
+  ctx.lineTo(-p.r * 1.12, p.r * 0.12);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+/** Shield glow around the ship (color shifts with shield strength), plus immunity pulse. */
 function drawShieldImmunityRingsWorld(p) {
   const t = game.lastTs;
   ctx.save();
@@ -2140,20 +2197,26 @@ function drawShieldImmunityRingsWorld(p) {
 
   if (game.shield > 0) {
     const shieldRatio = clamp(game.shield / MAX_SHIELD, 0, 1);
-    const pulse = 0.88 + Math.sin(t * 0.0045) * 0.12;
-    const alpha = (0.25 + shieldRatio * 0.55) * pulse;
-    const wobble = Math.sin(t * 0.011) * 1.25;
-    ctx.strokeStyle = `rgba(130, 214, 255, ${alpha})`;
-    ctx.lineWidth = 2 + shieldRatio * 3 + wobble;
+    const pulse = 0.9 + Math.sin(t * 0.0056) * 0.1;
+    // Static oval envelope (nose-right), no direction-following rotation.
+    const r = Math.round(70 + shieldRatio * 70);
+    const g = Math.round(220 + shieldRatio * 30);
+    const b = Math.round(130 + shieldRatio * 110);
+    const coreA = (0.015 + shieldRatio * 0.2) * pulse;
+    const midA = (0.045 + shieldRatio * 0.32) * pulse;
+    const outerA = (0.01 + shieldRatio * 0.17) * pulse;
+    const glow = ctx.createRadialGradient(0, 0, p.r * 0.18, 0, 0, p.r * 2.35);
+    glow.addColorStop(0, `rgba(${r + 30}, ${g + 12}, ${b + 10}, ${coreA})`);
+    glow.addColorStop(0.4, `rgba(${r}, ${g}, ${b}, ${midA})`);
+    glow.addColorStop(0.82, `rgba(${r}, ${g}, ${b}, ${outerA})`);
+    glow.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+    ctx.globalCompositeOperation = "screen";
+    ctx.fillStyle = glow;
     ctx.beginPath();
-    ctx.arc(0, 0, p.r + 10, 0, Math.PI * 2);
-    ctx.stroke();
+    ctx.ellipse(0, 0, p.r * (2.35 + shieldRatio * 0.5), p.r * (1.18 + shieldRatio * 0.22), 0, 0, Math.PI * 2);
+    ctx.fill();
 
-    ctx.strokeStyle = `rgba(160, 230, 255, ${0.35 * pulse * shieldRatio})`;
-    ctx.lineWidth = 1.25;
-    ctx.beginPath();
-    ctx.arc(0, 0, p.r + 14 + Math.sin(t * 0.0075) * 3.5, 0, Math.PI * 2);
-    ctx.stroke();
+    // Pure glow style: no explicit ring/outline strokes.
   }
 
   if (game.immunityTimer > 0 && Math.floor(t / 120) % 2 === 0) {
@@ -2280,6 +2343,8 @@ function drawWorld() {
   const opt = getShipSkinOption();
   const bank = clamp(p.vy / MAX_SPEED, -1, 1) * 0.22;
   const flash = game.invuln > 0 && Math.floor(game.lastTs / 70) % 2 === 0;
+
+  drawShipThrusterWorld(p, bank);
 
   ctx.save();
   ctx.translate(p.x, p.y);
