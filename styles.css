@@ -255,6 +255,14 @@ input[type="range"] {
   color: #f0e6c8;
 }
 
+.settings-hint {
+  margin: -4px 0 14px;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: #b8c4d8;
+  max-width: 28rem;
+}
+
 .settings-field select {
   min-width: 12rem;
   max-width: 100%;

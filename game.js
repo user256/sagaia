@@ -29,6 +29,7 @@ const wikiCloseBtn = document.getElementById("wikiCloseBtn");
 const shipSkinSelectEl = document.getElementById("shipSkinSelect");
 const startLevelInputEl = document.getElementById("startLevelInput");
 const startAtBtn = document.getElementById("startAtBtn");
+const sectorBossFightsChkEl = document.getElementById("sectorBossFightsChk");
 const mobileLeftBtn = document.getElementById("mobileLeftBtn");
 const mobileDpadUpBtn = document.getElementById("mobileDpadUpBtn");
 const mobileRightBtn = document.getElementById("mobileRightBtn");
@@ -72,6 +73,8 @@ const MINE_CHAIN_BOOM_SHIELD = 5;
 const BLASTER_BASE_SPREAD = 0.2;
 /** At full forward `vx`, spread shrinks by this fraction (tier 2+ only). */
 const BLASTER_SPREAD_FORWARD_TIGHTEN = 0.72;
+/** Floor so triple/aft volleys stay separated when flying forward (radians). */
+const BLASTER_MIN_SPREAD_TIER2PLUS = 0.11;
 /** Player shots: range ≈ speed × life (world px before timeout). */
 const BLASTER_BULLET_SPEED = 585;
 const BLASTER_BULLET_LIFE = 1.38;
@@ -100,7 +103,7 @@ const HAZARD_GAP_PAD = 34;
 const MINE_SPEED_BASE = 118;
 const MINE_SPEED_PER_LEVEL = 12;
 /** Map scrolls left under you (px/s); ship is not pushed by this. */
-const AUTO_SCROLL_SPEED = 64;
+const AUTO_SCROLL_SPEED = 64 * 0.95;
 /** Diagonal meteor hazards (world-space). Size scales both threat and reward. */
 const METEOR_RADIUS_MIN = 15;
 const METEOR_RADIUS_MAX = 32;
@@ -112,6 +115,27 @@ const METEOR_MAX_ALIVE = 4;
 const METEOR_DROP_SHIELD_CHANCE = 0.72;
 /** Rare meteor cache: enhanced deflector salvage (burst refill or shave cooldown). */
 const METEOR_DROP_BROWN_DEFLECTOR_CHANCE = 0.065;
+/** Sector 4+: rare meteor drop; multiplies F+G bullet damage by `WEAPON_UPGRADE_MULT` per pickup. */
+const METEOR_DROP_WEAPON_UPGRADE_CHANCE = 0.038;
+const WEAPON_UPGRADE_LEVEL_MIN = 4;
+const WEAPON_UPGRADE_MULT = 1.1;
+/** Hostile station wreck: common weapon capacitor orb (sector 4+). */
+const HOSTILE_STATION_WEAPON_UPGRADE_CHANCE = 0.78;
+/** One-time reverse thruster upgrade from hostile station (removed from pool once owned). */
+const HOSTILE_STATION_REVERSE_BOOST_CHANCE = 0.46;
+const METEOR_DROP_REVERSE_BOOST_CHANCE = 0.03;
+/** Stronger left thrust after upgrade. */
+const REVERSE_THRUST_ACCEL_MULT = 1.62;
+/** Minimum leftward speed (px/s) to count as reverse ram vs hostiles. */
+const REVERSE_RAM_MIN_VX = -44;
+const REVERSE_RAM_BASE_DAMAGE = 30;
+/** Wing drones: duration after flawless hostile-station kill (player hull+shield max). */
+const DRONE_GUARD_DURATION_SEC = 38;
+const DRONE_GUARD_CHEAT_DURATION_SEC = 720;
+const DRONE_GUARD_R_MULT = 0.68;
+const DRONE_GUARD_STRAFE_MULT = 1.42;
+/** Nose +X: shift escorts toward −X so they sit behind the hull silhouette. */
+const DRONE_GUARD_AFT_X_MULT = 0.55;
 /** Max seconds per burst in brown before cooldown; upgrades raise toward max. */
 const ENHANCED_DEFLECTOR_BURST_START = 3;
 const ENHANCED_DEFLECTOR_BURST_MAX = 20;
@@ -188,6 +212,26 @@ function stationDrawWidth() {
 /** Keep ship inside the visible band (no damage from these edges — soft stop only). */
 const VIEWPORT_EDGE_PAD = 14;
 
+/** Sector 1 end boss: King Fossil–style coelacanth; map scroll pauses until it is destroyed. */
+const SECTOR_BOSS_L1_HP = 218;
+const SECTOR_BOSS_L1_HIT_R_MULT = 6.35;
+const SECTOR_BOSS_L1_SWAY_X = 118;
+const SECTOR_BOSS_L1_SWAY_Y = 36;
+/** Tier 1: shorter exposure window, faster shots. */
+const SECTOR_BOSS_L1_VOLLEY_DURATION = 1.38;
+const SECTOR_BOSS_L1_FIRE_INTERVAL = 0.2;
+const SECTOR_BOSS_L1_FIREBALL_SPEED = 418;
+const SECTOR_BOSS_L1_FIREBALL_DMG = 54;
+const SECTOR_BOSS_L2_FIREBALL_DMG = 42;
+const SECTOR_BOSS_L1_BODY_DMG = 48;
+const SECTOR_BOSS_L1_SMASH_DMG = 101;
+const SECTOR_BOSS_L1_KILL_SCORE = 155;
+/**
+ * Global boss arena tuning (set to 1 to revert): HP (“shields”), boss fireball + body + smash damage,
+ * and slam dash velocity scale by this factor for every arena/tier until you change it.
+ */
+const SECTOR_BOSS_DEFAULT_STAT_MULT = 1.1;
+
 /** Rotate raster SVGs +90° so “up” in the asset becomes nose-right. Classic polygon is drawn nose-right already. */
 const RASTER_SHIP_ROTATION = Math.PI / 2;
 
@@ -212,6 +256,12 @@ const game = {
     largeMode: defaultLargeModeForDesktop(),
     startLevel: 1,
     shipSkin: "serenity",
+    /** When true (default), clearing a sector docks first; continue runs a separate boss arena before the next sector. */
+    sectorBossFights: true,
+    /** Set from `?boss=N` — boot straight into boss arena (persists until you change the URL). */
+    bootBossTier: null,
+    /** Tokens from `?cheat=` / `?cheats=` (e.g. raptor, darius2). */
+    queryCheats: [],
   },
   player: null,
   clouds: [],
@@ -249,6 +299,12 @@ const game = {
   blasterCooldown: 0,
   hasSecondaryWeapon: false,
   secondaryCooldown: 0,
+  /** F + G damage multiplier; +10% per capacitor (sector 4+ drops). */
+  weaponPowerMult: 1,
+  /** Flat damage per F / G / drone shot (stacks +10 each boss clear). */
+  weaponFlatBonus: 0,
+  /** Ship top-speed multiplier; ×1.01 per boss clear (compounds). */
+  playerSpeedMult: 1,
   bullets: [],
   mysterySpawnTimer: 0,
   /** Timer-driven mystery spawns this sector (capped). */
@@ -280,10 +336,46 @@ const game = {
   enhancedDeflectorBurstMax: ENHANCED_DEFLECTOR_BURST_START,
   enhancedDeflectorBurstLeft: 0,
   enhancedDeflectorCooldown: 0,
+  /** One-time: faster reverse thrust, 2× aft plume when holding left, ram damage into hostiles while reversing. */
+  hasAcceleratedReverse: false,
+  /** Escorts above/below; F+G at half rate vs main. Cheat RAPTOR or flawless station kill. */
+  droneGuardsTimeRemaining: 0,
+  droneBlasterHalfToggle: false,
+  droneSecondaryHalfToggle: false,
+  /** Non-null freezes auto-scroll; boss only appears in the boss arena (not at the station). */
+  sectorBoss: null,
+  /** Non-null while in a standalone boss map (`buildBossArena`). */
+  bossArenaTier: null,
+  /** After station clear: next continue opens boss arena instead of the next sector. */
+  pendingBossAfterStation: false,
+  /** After boss kill: next continue increments sector. */
+  advanceLevelAfterBoss: false,
+  /** `?boss=N` without starting: spawn boss on first click. */
+  deferredBossInitTier: null,
   paused: false,
   started: false,
   lastTs: 0,
 };
+
+function playerMoveSpeedScale() {
+  return game.playerSpeedMult ?? 1;
+}
+
+function playerBlasterDamage() {
+  return 1 * game.weaponPowerMult + (game.weaponFlatBonus ?? 0);
+}
+
+function playerSecondaryShotDamage() {
+  return 4 * game.weaponPowerMult + (game.weaponFlatBonus ?? 0);
+}
+
+function smartMissileImpactDamage() {
+  return SMART_MISSILE_HOSTILE_DAMAGE + (game.weaponFlatBonus ?? 0);
+}
+
+function sectorBossDefaultDamage(n) {
+  return Math.max(1, Math.round(n * SECTOR_BOSS_DEFAULT_STAT_MULT));
+}
 
 let cheatBuffer = "";
 
@@ -680,6 +772,8 @@ function buildLevel(sector) {
   game.hostileSpawnTimer = randf(HOSTILE_SPAWN_INTERVAL_MIN, HOSTILE_SPAWN_INTERVAL_MAX);
   game.smartMissiles = [];
   game.smartMissileFireAcc = 0;
+  game.sectorBoss = null;
+  game.bossArenaTier = null;
 }
 
 function getMysteryTimerSpawnCap() {
@@ -720,7 +814,9 @@ function rollMysteryPowerupKind() {
   if (r < 0.91) return 6;
   if (r < 0.925) return 7;
   if (r < 0.965) return 8;
-  return 9;
+  if (r < 0.977) return 9;
+  if (r < 0.989) return 11;
+  return 10;
 }
 
 function absorbDamage(amount) {
@@ -771,13 +867,17 @@ function fireSecondaryVolley() {
       vy: fy * SECONDARY_BULLET_SPEED,
       radius: 5.2,
       life: SECONDARY_BULLET_LIFE,
-      damage: 4,
+      damage: playerSecondaryShotDamage(),
       kind: "secondary",
     });
   };
   spawnSecondary(-1);
   spawnSecondary(1);
   game.secondaryCooldown = SECONDARY_FIRE_COOLDOWN;
+  if (droneGuardsActive() && game.hasSecondaryWeapon) {
+    game.droneSecondaryHalfToggle = !game.droneSecondaryHalfToggle;
+    if (game.droneSecondaryHalfToggle) fireDroneGuardsSecondaryVolley();
+  }
 }
 
 function applyCheatDariusIi() {
@@ -794,6 +894,107 @@ function applyCheatDariusIi() {
   game.hasDeflector = true;
   statusEl.textContent = "Cheat active: full shield + all weapon upgrades.";
   addOverlay("DARIUSII: Full Arsenal", "#b7f9ff");
+}
+
+function droneGuardsActive() {
+  return game.droneGuardsTimeRemaining > 0 && game.hasBlaster && game.player;
+}
+
+function playerVitalityFullForDroneUnlock() {
+  return game.hull >= MAX_HULL - 0.75 && game.shield >= MAX_SHIELD - 0.75;
+}
+
+/** Hostile station kill while **your** hull and shield are topped (MAX). */
+function tryGrantDroneGuardsFromFlawlessStationKill() {
+  if (!playerVitalityFullForDroneUnlock()) return;
+  game.droneGuardsTimeRemaining = Math.max(game.droneGuardsTimeRemaining, DRONE_GUARD_DURATION_SEC);
+  statusEl.textContent = "Perfect run — wing drones online!";
+  addOverlay("Drone guards deployed!", "#9fd8ff");
+}
+
+function applyCheatRaptor() {
+  game.droneGuardsTimeRemaining = Math.max(game.droneGuardsTimeRemaining, DRONE_GUARD_CHEAT_DURATION_SEC);
+  statusEl.textContent = "Cheat: drone wingmen — mirror fire at half rate.";
+  addOverlay("RAPTOR: Drone guards", "#9fd8ff");
+}
+
+function fireDroneGuardsBlasterVolley() {
+  if (!droneGuardsActive()) return;
+  const p = game.player;
+  const bulletSpeed = BLASTER_BULLET_SPEED;
+  const tier = Math.max(1, game.blasterTier || 1);
+  let spread = BLASTER_BASE_SPREAD;
+  if (tier >= 2) {
+    const fwd = clamp(p.vx / (MAX_SPEED * playerMoveSpeedScale()), 0, 1);
+    spread *= 1 - BLASTER_SPREAD_FORWARD_TIGHTEN * fwd;
+    spread = Math.max(spread, BLASTER_MIN_SPREAD_TIER2PLUS);
+  }
+  const ang0 = getPlayerShotAimAngle();
+  const gap = p.r * DRONE_GUARD_STRAFE_MULT;
+  const dr = p.r * DRONE_GUARD_R_MULT;
+  const ax = p.x - p.r * DRONE_GUARD_AFT_X_MULT;
+  const dmg = playerBlasterDamage();
+  const pushBlaster = (cy, ang) => {
+    game.bullets.push({
+      x: ax + Math.cos(ang) * (dr + 7),
+      y: cy + Math.sin(ang) * (dr + 7),
+      vx: Math.cos(ang) * bulletSpeed,
+      vy: Math.sin(ang) * bulletSpeed,
+      radius: 3.5,
+      life: BLASTER_BULLET_LIFE,
+      damage: dmg,
+      kind: "droneBlaster",
+    });
+  };
+  const fanAt = (cy) => {
+    if (tier === 1) pushBlaster(cy, ang0);
+    else if (tier === 2) {
+      pushBlaster(cy, ang0 - spread);
+      pushBlaster(cy, ang0);
+      pushBlaster(cy, ang0 + spread);
+    } else {
+      pushBlaster(cy, ang0 - spread);
+      pushBlaster(cy, ang0);
+      pushBlaster(cy, ang0 + spread);
+      const back = ang0 + Math.PI;
+      pushBlaster(cy, back - spread);
+      pushBlaster(cy, back);
+      pushBlaster(cy, back + spread);
+    }
+  };
+  fanAt(p.y - gap);
+  fanAt(p.y + gap);
+}
+
+function fireDroneGuardsSecondaryVolley() {
+  if (!droneGuardsActive() || !game.hasSecondaryWeapon) return;
+  const p = game.player;
+  const ang = SECONDARY_FORWARD_ANGLE;
+  const nx = Math.cos(ang + Math.PI * 0.5);
+  const ny = Math.sin(ang + Math.PI * 0.5);
+  const fx = Math.cos(ang);
+  const fy = Math.sin(ang);
+  const gap = p.r * DRONE_GUARD_STRAFE_MULT;
+  const dr = p.r * DRONE_GUARD_R_MULT;
+  const ax = p.x - p.r * DRONE_GUARD_AFT_X_MULT;
+  const dmg = playerSecondaryShotDamage();
+  const offS = SECONDARY_PAIR_OFFSET * (dr / p.r);
+  for (const cy of [p.y - gap, p.y + gap]) {
+    for (const side of [-1, 1]) {
+      const ox = nx * offS * side;
+      const oy = ny * offS * side;
+      game.bullets.push({
+        x: ax + fx * (dr + 9) + ox,
+        y: cy + fy * (dr + 9) + oy,
+        vx: fx * SECONDARY_BULLET_SPEED,
+        vy: fy * SECONDARY_BULLET_SPEED,
+        radius: 4.6,
+        life: SECONDARY_BULLET_LIFE,
+        damage: dmg,
+        kind: "secondary",
+      });
+    }
+  }
 }
 
 /** Brown gas walls only: penetration into the band (not used for purple nebula). */
@@ -895,6 +1096,46 @@ function applyEnhancedDeflectorBurstCapUpgrade() {
   addOverlay(`Enhanced deflector · ${game.enhancedDeflectorBurstMax}s burst cap`, "#e8c89a");
 }
 
+function applyWeaponPowerUpgrade() {
+  if (game.level < WEAPON_UPGRADE_LEVEL_MIN) return;
+  game.weaponPowerMult *= WEAPON_UPGRADE_MULT;
+  addOverlay(`Weapons +10% (×${game.weaponPowerMult.toFixed(2)})`, "#ffe066");
+}
+
+function spawnWeaponUpgradeOrb(x, y) {
+  if (game.level < WEAPON_UPGRADE_LEVEL_MIN) return;
+  game.mysteries.push({
+    x: clamp(x, 22, game.levelWidth - 22),
+    y: clamp(y, 22, WORLD.height - 22),
+    radius: 10,
+    color: "#e8a020",
+    kind: "weaponPowerOrb",
+  });
+}
+
+function spawnReverseBoostOrb(x, y) {
+  if (game.hasAcceleratedReverse) return;
+  game.mysteries.push({
+    x: clamp(x, 22, game.levelWidth - 22),
+    y: clamp(y, 22, WORLD.height - 22),
+    radius: 10,
+    color: "#5ee0c5",
+    kind: "reverseBoostOrb",
+  });
+}
+
+function trySpawnHostileStationReverseBoost(x, y) {
+  if (game.hasAcceleratedReverse) return;
+  if (Math.random() >= HOSTILE_STATION_REVERSE_BOOST_CHANCE) return;
+  spawnReverseBoostOrb(x + randf(-26, 26), y + randf(-18, 18));
+}
+
+function trySpawnHostileStationWeaponUpgrade(x, y) {
+  if (game.level < WEAPON_UPGRADE_LEVEL_MIN) return;
+  if (Math.random() >= HOSTILE_STATION_WEAPON_UPGRADE_CHANCE) return;
+  spawnWeaponUpgradeOrb(x + randf(-22, 22), y + randf(-16, 16));
+}
+
 function spawnBrownDeflectorOrb(x, y, salvageKind) {
   game.mysteries.push({
     x: clamp(x, 22, game.levelWidth - 22),
@@ -915,6 +1156,11 @@ function applyShieldRegenFromScoreDelta(dScore) {
 
 /** Shift the whole sector left; advance scroll anchor; sync camera to horizon; cull content that left the frontier. */
 function applyMapScrollAndCull(dt) {
+  if (sectorBossActive()) {
+    const maxCam = Math.max(0, game.levelWidth - WORLD.width);
+    game.cameraX = clamp(game.worldScrollAnchor, 0, maxCam);
+    return;
+  }
   const dx = AUTO_SCROLL_SPEED * dt;
   game.goalX -= dx;
   game.worldScrollAnchor += dx;
@@ -1099,6 +1345,25 @@ function applyMysteryPowerup() {
     } else {
       statusEl.textContent = "Mystery prize: enhanced deflector salvage.";
     }
+  } else if (roll === 10) {
+    if (game.level < WEAPON_UPGRADE_LEVEL_MIN) {
+      game.score += MYSTERY_MAXED_BONUS;
+      statusEl.textContent = `Mystery prize: schematic (sector ${WEAPON_UPGRADE_LEVEL_MIN}+) — +${MYSTERY_MAXED_BONUS} credits.`;
+      addOverlay(`POWERUP: Bonus +${MYSTERY_MAXED_BONUS}`, "#f2e2a0");
+    } else {
+      applyWeaponPowerUpgrade();
+      statusEl.textContent = "Mystery prize: weapon capacitors — F and G +10%!";
+    }
+  } else if (roll === 11) {
+    if (game.hasAcceleratedReverse) {
+      game.score += MYSTERY_MAXED_BONUS;
+      statusEl.textContent = `Mystery prize: reverse drive already fitted — +${MYSTERY_MAXED_BONUS} credits.`;
+      addOverlay(`POWERUP: Bonus +${MYSTERY_MAXED_BONUS}`, "#f2e2a0");
+    } else {
+      game.hasAcceleratedReverse = true;
+      statusEl.textContent = "Mystery prize: vectored reverse — faster back thrust and aft ram!";
+      addOverlay("POWERUP: Accelerated reverse", "#9dffce");
+    }
   }
 }
 
@@ -1107,6 +1372,7 @@ function updatePlayer(dt) {
   game.immunityTimer = Math.max(0, game.immunityTimer - dt);
   game.blasterCooldown = Math.max(0, game.blasterCooldown - dt);
   game.secondaryCooldown = Math.max(0, game.secondaryCooldown - dt);
+  game.droneGuardsTimeRemaining = Math.max(0, game.droneGuardsTimeRemaining - dt);
 
   if (game.started && !game.gameOver && !game.paused && !game.won && game.hasBlaster) {
     if (isBlasterFireHeld()) fireBlasterVolley();
@@ -1125,11 +1391,14 @@ function updatePlayer(dt) {
   const len = Math.hypot(ix, iy);
   const accel = ACCEL;
   if (len > 0) {
-    p.vx += (ix / len) * accel * dt * HORIZ_ACCEL_MULT;
+    let hAccel = HORIZ_ACCEL_MULT;
+    if (game.hasAcceleratedReverse && ix < 0) hAccel *= REVERSE_THRUST_ACCEL_MULT;
+    p.vx += (ix / len) * accel * dt * hAccel;
     p.vy += (iy / len) * accel * dt * VERT_ACCEL_MULT;
   }
-  const maxVx = MAX_SPEED;
-  const maxVy = MAX_SPEED * VERT_MAX_SPEED_RATIO;
+  const sm = playerMoveSpeedScale();
+  const maxVx = MAX_SPEED * sm;
+  const maxVy = MAX_SPEED * VERT_MAX_SPEED_RATIO * sm;
   const n2 = (p.vx / maxVx) ** 2 + (p.vy / maxVy) ** 2;
   if (n2 > 1) {
     const s = 1 / Math.sqrt(n2);
@@ -1301,7 +1570,10 @@ function updatePlayer(dt) {
         game.enemyBullets.splice(ei, 1);
         absorbDamage(eb.damage ?? HOSTILE_BULLET_DAMAGE);
         game.invuln = INVULN_HIT * 0.52;
-        addOverlay(eb.kind === "turret" ? "Station fire!" : "Incoming fire!", "#ffa8d8");
+        addOverlay(
+          eb.kind === "turret" ? "Station fire!" : eb.kind === "bossFish" ? "Boss fire!" : "Incoming fire!",
+          "#ffa8d8"
+        );
         p.vx *= -0.22;
         p.vy *= -0.22;
         if (game.hull <= 0) game.gameOver = true;
@@ -1312,6 +1584,26 @@ function updatePlayer(dt) {
       const h = game.hostiles[hi];
       const rr = p.r + h.r * 0.9;
       if (Math.hypot(p.x - h.x, p.y - h.y) < rr) {
+        const backRam = game.hasAcceleratedReverse && p.vx <= REVERSE_RAM_MIN_VX;
+        if (backRam) {
+          const bodyBefore = h.bodyHp;
+          const shieldBefore = h.shield ?? 0;
+          const ramDmg = REVERSE_RAM_BASE_DAMAGE * game.weaponPowerMult;
+          const killed = applyDamageToHostileShieldFirst(h, ramDmg);
+          const threat = clamp(0.3 + 0.15 * bodyBefore + 0.035 * shieldBefore, 0.26, 1);
+          absorbCollisionDamage(Math.round(HOSTILE_COLLISION_DAMAGE * threat));
+          game.invuln = INVULN_HIT * 0.88;
+          addOverlay(killed ? "Reverse ram!" : "Aft ram — hostile holding!", killed ? "#9dffce" : "#ffb090");
+          p.vx *= -0.32;
+          p.vy *= -0.28;
+          if (killed) {
+            spawnMineExplosion(h.x, h.y, h.r * 0.85);
+            game.hostiles.splice(hi, 1);
+            addHostileKillScore();
+          }
+          if (game.hull <= 0) game.gameOver = true;
+          break;
+        }
         spawnMineExplosion(h.x, h.y, h.r);
         game.hostiles.splice(hi, 1);
         absorbCollisionDamage(HOSTILE_COLLISION_DAMAGE);
@@ -1368,6 +1660,18 @@ function updatePlayer(dt) {
       } else if (t.kind === "brownDeflectorOrb") {
         if (t.salvageKind === "upgrade") applyEnhancedDeflectorBurstCapUpgrade();
         else applyEnhancedDeflectorFuelPickup();
+      } else if (t.kind === "weaponPowerOrb") {
+        applyWeaponPowerUpgrade();
+        statusEl.textContent = "Weapon capacitors — F and G +10% damage.";
+      } else if (t.kind === "reverseBoostOrb") {
+        if (game.hasAcceleratedReverse) {
+          game.score += Math.round(MYSTERY_MAXED_BONUS * 0.75);
+          addOverlay("Salvage: duplicate drive — credits", "#f2e2a0");
+        } else {
+          game.hasAcceleratedReverse = true;
+          addOverlay("Accelerated reverse + aft ram", "#9dffce");
+          statusEl.textContent = "Reverse thruster upgrade — hold ← for 2× plume; ram hostiles when reversing.";
+        }
       } else {
         applyMysteryPowerup();
       }
@@ -1376,13 +1680,29 @@ function updatePlayer(dt) {
     return true;
   });
 
-  if (!game.won && playerInCheckpointRange()) {
-    game.won = true;
-    game.paused = true;
-    const bonus = 220 + game.level * 90;
-    game.score += bonus;
-    addOverlay(`Station checkpoint! +${bonus}`, "#9dff9d");
-    statusEl.textContent = "Sector clear — Space or tap for next sector.";
+  if (!game.won && playerInCheckpointRange() && !sectorBossActive()) {
+    triggerSectorWin();
+  }
+
+  if (canHit && sectorBossActive() && game.sectorBoss.kind === "l1Fish") {
+    const boss = game.sectorBoss;
+    const rr = p.r + boss.hitR * 0.9;
+    if (Math.hypot(p.x - boss.x, p.y - boss.y) < rr) {
+      const smash = boss.state === "smashDash";
+      absorbCollisionDamage(
+        sectorBossDefaultDamage(smash ? SECTOR_BOSS_L1_SMASH_DMG : SECTOR_BOSS_L1_BODY_DMG)
+      );
+      game.invuln = INVULN_HIT * (smash ? 1.05 : 0.92);
+      addOverlay(smash ? "Boss ram!" : "Boss hull!", "#ff9a9a");
+      const nx = p.x - boss.x;
+      const ny = p.y - boss.y;
+      const nlen = Math.hypot(nx, ny) || 1;
+      p.x = boss.x + (nx / nlen) * (boss.hitR * 0.9 + p.r + 6);
+      p.y = boss.y + (ny / nlen) * (boss.hitR * 0.9 + p.r + 6);
+      p.vx *= -0.35;
+      p.vy *= -0.32;
+      if (game.hull <= 0) game.gameOver = true;
+    }
   }
 
   /** Viewport slides only with scroll — ship stays inside it; edges do not deal damage. */
@@ -1475,6 +1795,14 @@ function spawnMeteorDrop(x, y, r) {
     spawnBrownDeflectorOrb(x, y, "fuel");
     return;
   }
+  if (!game.hasAcceleratedReverse && Math.random() < METEOR_DROP_REVERSE_BOOST_CHANCE) {
+    spawnReverseBoostOrb(x, y);
+    return;
+  }
+  if (game.level >= WEAPON_UPGRADE_LEVEL_MIN && Math.random() < METEOR_DROP_WEAPON_UPGRADE_CHANCE) {
+    spawnWeaponUpgradeOrb(x, y);
+    return;
+  }
   const isShield = Math.random() < METEOR_DROP_SHIELD_CHANCE;
   const t = clamp((r - METEOR_RADIUS_MIN) / (METEOR_RADIUS_MAX - METEOR_RADIUS_MIN), 0, 1);
   game.mysteries.push({
@@ -1502,7 +1830,7 @@ function updateMeteors(dt) {
 }
 
 function updateMeteorSpawns(dt) {
-  if (!game.started || game.gameOver || game.won) return;
+  if (!game.started || game.gameOver || game.won || sectorBossActive()) return;
   game.meteorSpawnTimer -= dt;
   if (game.meteorSpawnTimer > 0) return;
   spawnMeteor();
@@ -1528,7 +1856,7 @@ function trySpawnGasBlast() {
 }
 
 function updateGasBlastSpawns(dt) {
-  if (!game.started || game.gameOver || game.won) return;
+  if (!game.started || game.gameOver || game.won || sectorBossActive()) return;
   game.gasBlastTimer -= dt;
   if (game.gasBlastTimer > 0) return;
   trySpawnGasBlast();
@@ -1614,7 +1942,7 @@ function spawnHostileStation() {
 }
 
 function updateHostileStationSpawns(dt) {
-  if (!game.started || game.gameOver || game.won || game.level < 2) return;
+  if (!game.started || game.gameOver || game.won || sectorBossActive() || game.level < 2) return;
   game.hostileStationSpawnTimer -= dt;
   if (game.hostileStationSpawnTimer > 0) return;
   spawnHostileStation();
@@ -1680,7 +2008,7 @@ function spawnHostile() {
 }
 
 function updateHostileSpawns(dt) {
-  if (!game.started || game.gameOver || game.won) return;
+  if (!game.started || game.gameOver || game.won || sectorBossActive()) return;
   game.hostileSpawnTimer -= dt;
   if (game.hostileSpawnTimer > 0) return;
   spawnHostile();
@@ -1756,6 +2084,15 @@ function findSmartMissileAimPoint(mx, my, mvx, maxDist) {
   let bd = maxDist;
   const headingRight = mvx >= 0;
   const forwardPad = 20;
+  const boss = game.sectorBoss;
+  if (boss && boss.kind === "l1Fish") {
+    const d = Math.hypot(boss.x - mx, boss.y - my);
+    if (d < bd) {
+      bd = d;
+      bx = boss.x;
+      by = boss.y;
+    }
+  }
   const consider = (list, forwardOnly) => {
     for (const o of list) {
       if (forwardOnly) {
@@ -1839,6 +2176,23 @@ function handleSmartMissileHits() {
 
   for (let si = 0; si < game.smartMissiles.length; si += 1) {
     if (!aliveS[si]) continue;
+    const b = game.sectorBoss;
+    if (!b || b.kind !== "l1Fish") continue;
+    const s = game.smartMissiles[si];
+    const hurtR = b.hitR * 0.88;
+    if (Math.hypot(s.x - b.x, s.y - b.y) < s.radius + hurtR) {
+      aliveS[si] = false;
+      spawnMineExplosion(s.x, s.y, s.radius);
+      if (b.vulnerable) {
+        b.hp -= smartMissileImpactDamage();
+        spawnMineExplosion(b.x + randf(-16, 16), b.y + randf(-12, 12), 20);
+        if (b.hp <= 0) completeBossArenaVictory();
+      }
+    }
+  }
+
+  for (let si = 0; si < game.smartMissiles.length; si += 1) {
+    if (!aliveS[si]) continue;
     const s = game.smartMissiles[si];
     for (let hi = 0; hi < game.hostiles.length; hi += 1) {
       if (!aliveH[hi]) continue;
@@ -1846,7 +2200,7 @@ function handleSmartMissileHits() {
       if (Math.hypot(s.x - h.x, s.y - h.y) < s.radius + h.r) {
         aliveS[si] = false;
         spawnMineExplosion(s.x, s.y, s.radius);
-        if (applyDamageToHostileShieldFirst(h, SMART_MISSILE_HOSTILE_DAMAGE)) {
+        if (applyDamageToHostileShieldFirst(h, smartMissileImpactDamage())) {
           spawnMineExplosion(h.x, h.y, h.r * 0.85);
           aliveH[hi] = false;
           addHostileKillScore();
@@ -1866,11 +2220,14 @@ function handleSmartMissileHits() {
       if (Math.hypot(s.x - st.x, s.y - st.y) < s.radius + hitR) {
         aliveS[si] = false;
         spawnMineExplosion(s.x, s.y, s.radius);
-        if (applyDamageToHostileStationShieldFirst(st, SMART_MISSILE_HOSTILE_DAMAGE)) {
+        if (applyDamageToHostileStationShieldFirst(st, smartMissileImpactDamage())) {
           spawnMineExplosion(st.x, st.y, st.r * 1.1);
           aliveSt[ti] = false;
           game.score += 52 + Math.min(50, game.level * 5);
           spawnBrownDeflectorOrb(st.x, st.y, "fuel");
+          trySpawnHostileStationWeaponUpgrade(st.x, st.y);
+          trySpawnHostileStationReverseBoost(st.x, st.y);
+          tryGrantDroneGuardsFromFlawlessStationKill();
         }
         break;
       }
@@ -1924,8 +2281,9 @@ function fireBlasterVolley() {
   const tier = Math.max(1, game.blasterTier || 1);
   let spread = BLASTER_BASE_SPREAD;
   if (tier >= 2) {
-    const fwd = clamp(p.vx / MAX_SPEED, 0, 1);
+    const fwd = clamp(p.vx / (MAX_SPEED * playerMoveSpeedScale()), 0, 1);
     spread *= 1 - BLASTER_SPREAD_FORWARD_TIGHTEN * fwd;
+    spread = Math.max(spread, BLASTER_MIN_SPREAD_TIER2PLUS);
   }
   const spawnBullet = (ang) => {
     game.bullets.push({
@@ -1935,7 +2293,7 @@ function fireBlasterVolley() {
       vy: Math.sin(ang) * bulletSpeed,
       radius: 4,
       life: BLASTER_BULLET_LIFE,
-      damage: 1,
+      damage: playerBlasterDamage(),
     });
   };
   const ang0 = getPlayerShotAimAngle();
@@ -1955,6 +2313,10 @@ function fireBlasterVolley() {
     spawnBullet(back + spread);
   }
   game.blasterCooldown = 0.18;
+  if (droneGuardsActive()) {
+    game.droneBlasterHalfToggle = !game.droneBlasterHalfToggle;
+    if (game.droneBlasterHalfToggle) fireDroneGuardsBlasterVolley();
+  }
 }
 
 function updateBullets(dt) {
@@ -1967,6 +2329,30 @@ function updateBullets(dt) {
   game.bullets = game.bullets.filter(
     (b) => b.life > 0 && b.y > -50 && b.y < H + 50 && b.x < game.levelWidth + 80
   );
+}
+
+/** Player shots and hostile shots (stations, raiders, boss) mutually cancel on contact. */
+function handlePlayerBulletVsEnemyBulletHits() {
+  if (game.bullets.length === 0 || game.enemyBullets.length === 0) return;
+  const aliveB = new Array(game.bullets.length).fill(true);
+  const aliveE = new Array(game.enemyBullets.length).fill(true);
+  for (let bi = 0; bi < game.bullets.length; bi += 1) {
+    if (!aliveB[bi]) continue;
+    const b = game.bullets[bi];
+    for (let ei = 0; ei < game.enemyBullets.length; ei += 1) {
+      if (!aliveE[ei]) continue;
+      const eb = game.enemyBullets[ei];
+      const rr = b.radius + eb.radius;
+      if (Math.hypot(b.x - eb.x, b.y - eb.y) < rr) {
+        aliveB[bi] = false;
+        aliveE[ei] = false;
+        spawnMineExplosion((b.x + eb.x) * 0.5, (b.y + eb.y) * 0.5, 7);
+        break;
+      }
+    }
+  }
+  game.bullets = game.bullets.filter((_, idx) => aliveB[idx]);
+  game.enemyBullets = game.enemyBullets.filter((_, idx) => aliveE[idx]);
 }
 
 function handleBulletMineHits() {
@@ -2060,6 +2446,9 @@ function handleBulletStationHits() {
           aliveSt[ti] = false;
           game.score += 52 + Math.min(50, game.level * 5);
           spawnBrownDeflectorOrb(st.x, st.y, "fuel");
+          trySpawnHostileStationWeaponUpgrade(st.x, st.y);
+          trySpawnHostileStationReverseBoost(st.x, st.y);
+          tryGrantDroneGuardsFromFlawlessStationKill();
         }
         break;
       }
@@ -2067,6 +2456,555 @@ function handleBulletStationHits() {
   }
   game.bullets = game.bullets.filter((_, idx) => aliveB[idx]);
   game.hostileStations = game.hostileStations.filter((_, idx) => aliveSt[idx]);
+}
+
+function sectorBossActive() {
+  return game.sectorBoss != null;
+}
+
+/** Boss tier after clearing `sectorLevel` (null = dock goes straight to next sector). */
+function getBossTierForSector(sectorLevel) {
+  if (!game.settings.sectorBossFights) return null;
+  if (sectorLevel === 1) return 1;
+  if (sectorLevel === 2) return 2;
+  return null;
+}
+
+function triggerSectorWin() {
+  game.won = true;
+  game.paused = true;
+  game.pendingBossAfterStation = false;
+  game.advanceLevelAfterBoss = false;
+  const bonus = 220 + game.level * 90;
+  game.score += bonus;
+  addOverlay(`Station checkpoint! +${bonus}`, "#9dff9d");
+  if (getBossTierForSector(game.level) != null) {
+    game.pendingBossAfterStation = true;
+    statusEl.textContent = "Sector clear — Space / tap for boss arena.";
+  } else {
+    statusEl.textContent = "Sector clear — Space or tap for next sector.";
+  }
+}
+
+function buildBossArena(tier) {
+  const H = WORLD.height;
+  const W = WORLD.width + 340;
+  game.levelWidth = W;
+  game.goalX = W + 500;
+  game.stationY = -99999;
+  game.spawnX = 118;
+  game.spawnY = H * 0.5;
+  game.worldScrollAnchor = 0;
+  game.cameraX = 0;
+  game.gasWalls = [];
+  game.clouds = [];
+  game.mines = [];
+  game.coins = [];
+  game.mysteries = [];
+  game.mysteriesSpawnedFromTimer = 0;
+  game.mysterySpawnTimer = 999;
+  game.meteors = [];
+  game.meteorSpawnTimer = 99999;
+  game.gasBlasts = [];
+  game.gasBlastTimer = 99999;
+  game.bullets = [];
+  game.hostiles = [];
+  game.hostileStations = [];
+  game.hostileStationSpawnTimer = 99999;
+  game.hostileSpawnTimer = 99999;
+  game.enemyBullets = [];
+  game.smartMissiles = [];
+  game.smartMissileFireAcc = 0;
+  game.sectorBoss = null;
+  game.mineExplosions = [];
+  game.bossArenaTier = tier;
+}
+
+function initBossForTier(tier) {
+  if (game.sectorBoss) return;
+  const p = game.player;
+  if (!p) return;
+  const H = WORLD.height;
+  const anchorX = clamp(game.cameraX + WORLD.width * 0.74, 260, game.levelWidth - 95);
+  const baseY = H * 0.5;
+  const hpMult = 1 + Math.max(0, tier - 1) * 0.34;
+  const rMult = 1 + Math.max(0, tier - 1) * 0.065;
+  const hitR = Math.max(88, p.r * SECTOR_BOSS_L1_HIT_R_MULT * rMult);
+  const maxHp = Math.round(SECTOR_BOSS_L1_HP * hpMult * SECTOR_BOSS_DEFAULT_STAT_MULT);
+  game.sectorBoss = {
+    kind: "l1Fish",
+    tier,
+    anchorX,
+    baseY,
+    phase: 0,
+    x: anchorX,
+    y: baseY,
+    hitR,
+    hp: maxHp,
+    maxHp,
+    state: "patrol",
+    stateT: 2.85 + Math.random() * 0.55,
+    volleyCount: 0,
+    fireAcc: 0,
+    dashVx: 0,
+    dashVy: 0,
+    dashEndX: anchorX,
+    vulnerable: false,
+  };
+}
+
+function enterBossArena(tier) {
+  buildBossArena(tier);
+  const p = game.player;
+  if (p) {
+    p.x = game.spawnX;
+    p.y = game.spawnY;
+    p.vx = 0;
+    p.vy = 0;
+  }
+  game.bullets = [];
+  game.enemyBullets = [];
+  game.mineExplosions = [];
+  initBossForTier(tier);
+  addOverlay(`Boss arena — tier ${tier}`, "#7ec8ff");
+  statusEl.textContent = "Shielded except while it fires — dodge the charge.";
+}
+
+function completeBossArenaVictory() {
+  if (game.advanceLevelAfterBoss) return;
+  game.sectorBoss = null;
+  game.bossArenaTier = null;
+  game.score += SECTOR_BOSS_L1_KILL_SCORE + Math.min(60, game.level * 8);
+  game.won = true;
+  game.paused = true;
+  game.advanceLevelAfterBoss = true;
+  game.weaponFlatBonus += 10;
+  game.playerSpeedMult *= 1.01;
+  addOverlay("Boss destroyed!", "#9dffce");
+  addOverlay("Salvage: +10 shot damage · +1% move speed", "#c8ffd8");
+  statusEl.textContent = "Boss down — Space for next sector.";
+}
+
+function spawnSectorBossL1Fireball(boss, p) {
+  const dx = p.x - boss.x;
+  const dy = p.y - boss.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const bx = dx / len;
+  const by = dy / len;
+  const tier = boss.tier ?? 1;
+  const dmg = sectorBossDefaultDamage(
+    tier === 1 ? SECTOR_BOSS_L1_FIREBALL_DMG : SECTOR_BOSS_L2_FIREBALL_DMG
+  );
+  const spd = tier === 1 ? SECTOR_BOSS_L1_FIREBALL_SPEED : 395;
+  game.enemyBullets.push({
+    x: boss.x - boss.hitR * 0.55,
+    y: boss.y + (Math.random() - 0.5) * 22,
+    vx: bx * spd,
+    vy: by * spd,
+    radius: tier === 1 ? 9.5 : 9,
+    life: 2.8,
+    kind: "bossFish",
+    damage: dmg,
+  });
+}
+
+function updateSectorBoss(dt) {
+  const boss = game.sectorBoss;
+  if (!boss || boss.kind !== "l1Fish") return;
+  const p = game.player;
+  const H = WORLD.height;
+
+  boss.stateT -= dt;
+
+  const applySway = () => {
+    boss.phase += dt * 0.95;
+    boss.x = boss.anchorX + Math.sin(boss.phase) * SECTOR_BOSS_L1_SWAY_X;
+    boss.y = boss.baseY + Math.cos(boss.phase * 0.72) * SECTOR_BOSS_L1_SWAY_Y;
+    boss.y = clamp(boss.y, boss.hitR + 40, H - boss.hitR - 40);
+  };
+
+  if (boss.state === "smashDash") {
+    boss.vulnerable = false;
+    boss.x += boss.dashVx * dt;
+    boss.y += boss.dashVy * dt;
+    boss.y = clamp(boss.y, boss.hitR + 36, H - boss.hitR - 36);
+    if (boss.x <= (boss.dashEndX ?? game.cameraX - boss.hitR) || boss.stateT <= 0) {
+      boss.anchorX = clamp(boss.x, game.cameraX + WORLD.width * 0.48, game.levelWidth - 100);
+      boss.baseY = boss.y;
+      boss.state = "patrol";
+      boss.stateT = 2.6 + Math.random() * 0.9;
+    }
+    return;
+  }
+
+  applySway();
+
+  if (boss.state === "patrol") {
+    boss.vulnerable = false;
+    if (boss.stateT <= 0) {
+      const doSmash = boss.volleyCount >= 1 && boss.volleyCount % 2 === 0 && Math.random() < 0.62;
+      if (doSmash) {
+        boss.state = "smashWind";
+        boss.stateT = 0.68;
+      } else {
+        boss.state = "volley";
+        const tier = boss.tier ?? 1;
+        boss.stateT = tier === 1 ? SECTOR_BOSS_L1_VOLLEY_DURATION : 1.78;
+        boss.fireAcc = 0;
+        boss.volleyCount += 1;
+      }
+    }
+    return;
+  }
+
+  if (boss.state === "smashWind") {
+    boss.vulnerable = false;
+    if (boss.stateT <= 0) {
+      if (p) {
+        boss.state = "smashDash";
+        const dy = p.y - boss.y;
+        const ny = clamp(dy * 1.15, -1, 1);
+        const sm = SECTOR_BOSS_DEFAULT_STAT_MULT;
+        boss.dashVx = Math.round(-618 * sm);
+        boss.dashVy = Math.round(ny * 360 * sm);
+        boss.dashEndX = game.cameraX - boss.hitR - 18;
+        const dashDist = Math.max(80, boss.x - boss.dashEndX);
+        const dashSpeed = Math.max(1, Math.abs(boss.dashVx));
+        boss.stateT = dashDist / dashSpeed + 0.35;
+      } else {
+        boss.state = "patrol";
+        boss.stateT = 2.2;
+      }
+    }
+    return;
+  }
+
+  if (boss.state === "volley") {
+    boss.vulnerable = true;
+    boss.fireAcc += dt;
+    const fireEvery = (boss.tier ?? 1) === 1 ? SECTOR_BOSS_L1_FIRE_INTERVAL : 0.27;
+    if (p && boss.fireAcc >= fireEvery) {
+      boss.fireAcc = 0;
+      spawnSectorBossL1Fireball(boss, p);
+    }
+    if (boss.stateT <= 0) {
+      boss.state = "patrol";
+      boss.stateT = 2.5 + Math.random() * 1.1;
+      boss.vulnerable = false;
+    }
+  }
+}
+
+function handleBulletSectorBossHits() {
+  const boss = game.sectorBoss;
+  if (!boss || boss.kind !== "l1Fish" || !boss.vulnerable || game.bullets.length === 0) return;
+  const hurtR = boss.hitR * 0.88;
+  const aliveB = new Array(game.bullets.length).fill(true);
+  for (let bi = 0; bi < game.bullets.length; bi += 1) {
+    if (!aliveB[bi]) continue;
+    const b = game.bullets[bi];
+    if (Math.hypot(b.x - boss.x, b.y - boss.y) < b.radius + hurtR) {
+      aliveB[bi] = false;
+      boss.hp -= b.damage ?? 1;
+      spawnMineExplosion(boss.x + randf(-20, 20), boss.y + randf(-14, 14), 22);
+      if (boss.hp <= 0) {
+        completeBossArenaVictory();
+        break;
+      }
+    }
+  }
+  game.bullets = game.bullets.filter((_, idx) => aliveB[idx]);
+}
+
+/** Jagged Darius-style shield outline (ellipse sampled with noise). */
+function bossJaggedAuraPath(ctx, r, ts, wind, extraAmp) {
+  const n = 52;
+  const amp = (wind ? 0.11 : 0.065) + extraAmp;
+  ctx.beginPath();
+  for (let i = 0; i <= n; i += 1) {
+    const a = (i / n) * Math.PI * 2;
+    const wobble =
+      1 +
+      amp * Math.sin(a * 6 + ts * 0.019) * Math.sin(a * 11 + ts * 0.014) +
+      0.06 * Math.sin(a * 17 + ts * 0.022);
+    const squashX = 1.05 + 0.1 * Math.cos(a * 2);
+    const squashY = 0.72 + 0.08 * Math.sin(a * 3);
+    const x = Math.cos(a) * r * 1.38 * squashX * wobble;
+    const y = Math.sin(a) * r * 0.78 * squashY * wobble;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+function drawSectorBossWorld() {
+  const boss = game.sectorBoss;
+  if (!boss || boss.kind !== "l1Fish") return;
+  const r = boss.hitR;
+  const tier = boss.tier ?? 1;
+  const shielded = !boss.vulnerable;
+  const wind = boss.state === "smashWind";
+  const ts = game.lastTs;
+  const pulse = 0.5 + 0.5 * Math.sin(ts * 0.011);
+
+  const warm = tier >= 2;
+  const blueA = warm ? "#3a1a22" : "#0a2248";
+  const blueB = warm ? "#6a3040" : "#1a4a8c";
+  const blueC = warm ? "#4a2030" : "#2566b8";
+  const blueHi = warm ? "#a06070" : "#4a9ee8";
+  const scaleShadow = warm ? "#2a1018" : "#061830";
+  const silver = warm ? "#8a7878" : "#a8b4c4";
+  const silverDeep = warm ? "#4a3c40" : "#5a6878";
+  const trim = warm ? "#d8a878" : "#c8dce8";
+  const vent = warm ? "#ff4048" : "#ff3038";
+
+  ctx.save();
+  ctx.translate(boss.x, boss.y);
+  ctx.scale(-1, 1);
+
+  ctx.save();
+  ctx.globalAlpha = 0.45;
+  ctx.fillStyle = "#010208";
+  ctx.beginPath();
+  ctx.ellipse(12, r * 0.28, r * 1.12, r * 0.38, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  if (shielded || wind) {
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    bossJaggedAuraPath(ctx, r, ts, wind, pulse * 0.04);
+    const ag = ctx.createRadialGradient(0, 0, r * 0.08, 0, 0, r * 1.55);
+    ag.addColorStop(0, wind ? "rgba(255,248,200,0.55)" : `rgba(255,210,90,${0.25 + pulse * 0.2})`);
+    ag.addColorStop(0.35, "rgba(255,130,40,0.28)");
+    ag.addColorStop(0.7, "rgba(255,60,20,0.12)");
+    ag.addColorStop(1, "rgba(120,20,10,0)");
+    ctx.fillStyle = ag;
+    ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    bossJaggedAuraPath(ctx, r, ts + 40, wind, pulse * 0.03);
+    ctx.strokeStyle = wind ? "rgba(255,240,160,0.85)" : `rgba(255,200,80,${0.55 + pulse * 0.25})`;
+    ctx.lineWidth = wind ? 3.2 : 2.4;
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(255,255,200,0.35)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(r * 0.98, r * 0.42);
+  ctx.bezierCurveTo(r * 0.35, r * 0.58, -r * 0.55, r * 0.52, -r * 1.38, r * 0.28);
+  ctx.bezierCurveTo(-r * 1.48, r * 0.12, -r * 1.42, 0, -r * 1.38, -r * 0.28);
+  ctx.bezierCurveTo(-r * 0.55, -r * 0.52, r * 0.35, -r * 0.58, r * 0.98, -r * 0.42);
+  ctx.bezierCurveTo(r * 1.02, -r * 0.08, r * 1.02, r * 0.08, r * 0.98, r * 0.42);
+  ctx.closePath();
+  const bellyG = ctx.createLinearGradient(0, r * 0.55, 0, -r * 0.55);
+  bellyG.addColorStop(0, silverDeep);
+  bellyG.addColorStop(0.45, silver);
+  bellyG.addColorStop(1, silverDeep);
+  ctx.fillStyle = bellyG;
+  ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.35)";
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+
+  ctx.strokeStyle = "rgba(255,60,70,0.5)";
+  ctx.lineWidth = 1.1;
+  ctx.globalAlpha = 0.85;
+  for (let k = 0; k < 9; k += 1) {
+    const tx = -r * 1.15 + k * r * 0.28;
+    const ty = r * 0.08 + Math.sin(k * 1.7) * r * 0.06;
+    ctx.beginPath();
+    ctx.arc(tx, ty, r * 0.028, 0, Math.PI * 2);
+    ctx.fillStyle = vent;
+    ctx.globalAlpha = 0.35 + pulse * 0.25;
+    ctx.fill();
+    ctx.globalAlpha = 0.85;
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  const drawArmoredScale = (cx, cy, rot, sc, shade) => {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(rot);
+    ctx.scale(sc, sc * 1.08);
+    const sg = ctx.createLinearGradient(-r * 0.14, -r * 0.14, r * 0.14, r * 0.14);
+    sg.addColorStop(0, shade);
+    sg.addColorStop(0.45, blueHi);
+    sg.addColorStop(1, scaleShadow);
+    ctx.beginPath();
+    ctx.moveTo(0, -r * 0.13);
+    ctx.lineTo(r * 0.11, 0);
+    ctx.lineTo(0, r * 0.13);
+    ctx.lineTo(-r * 0.11, 0);
+    ctx.closePath();
+    ctx.fillStyle = sg;
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.45)";
+    ctx.lineWidth = 1.1;
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(200,235,255,0.2)";
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+    ctx.restore();
+  };
+
+  const nScales = 17;
+  for (let i = 0; i < nScales; i += 1) {
+    const t = i / (nScales - 1);
+    const cx = -r * 1.12 + t * r * 2.05;
+    const bulge = Math.sin(t * Math.PI) * r * 0.44;
+    const cy = -r * 0.2 - bulge * 0.88;
+    const row = i % 2;
+    const shade = i % 3 === 0 ? blueA : i % 3 === 1 ? blueB : blueC;
+    drawArmoredScale(cx, cy + row * r * 0.07, -0.08 + t * 0.12, 0.92 + (i % 4) * 0.04, shade);
+    if (t > 0.12 && t < 0.92) {
+      drawArmoredScale(cx - r * 0.14, cy + r * 0.1 + row * r * 0.05, 0.05, 0.78, blueB);
+    }
+  }
+
+  ctx.strokeStyle = "rgba(255,50,60,0.35)";
+  ctx.lineWidth = 1.2;
+  for (let s = 0; s < 7; s += 1) {
+    const sx = -r * 1.05 + s * r * 0.32;
+    ctx.beginPath();
+    ctx.moveTo(sx, r * 0.18);
+    ctx.lineTo(sx + r * 0.04, -r * 0.12);
+    ctx.stroke();
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(-r * 0.02, -r * 0.5);
+  ctx.lineTo(-r * 0.18, -r * 1.02);
+  ctx.lineTo(-r * 0.48, -r * 0.46);
+  ctx.lineTo(-r * 0.28, -r * 0.38);
+  ctx.closePath();
+  const df = ctx.createLinearGradient(0, -r, 0, -r * 0.4);
+  df.addColorStop(0, blueHi);
+  df.addColorStop(0.5, blueC);
+  df.addColorStop(1, blueB);
+  ctx.fillStyle = df;
+  ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.5)";
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+  for (let b = 0; b < 4; b += 1) {
+    const bx = -r * 0.15 - b * r * 0.08;
+    ctx.beginPath();
+    ctx.moveTo(bx, -r * 0.42);
+    ctx.lineTo(bx - r * 0.03, -r * 0.88);
+    ctx.stroke();
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(-r * 1.38, -r * 0.12);
+  ctx.lineTo(-r * 1.92, -r * 0.52);
+  ctx.lineTo(-r * 1.88, -r * 0.05);
+  ctx.lineTo(-r * 2.02, 0);
+  ctx.lineTo(-r * 1.88, r * 0.05);
+  ctx.lineTo(-r * 1.92, r * 0.52);
+  ctx.lineTo(-r * 1.38, r * 0.12);
+  ctx.closePath();
+  ctx.fillStyle = blueB;
+  ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.5)";
+  ctx.lineWidth = 1.35;
+  ctx.stroke();
+  ctx.strokeStyle = blueHi;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(-r * 1.45, 0);
+  ctx.lineTo(-r * 1.88, 0);
+  ctx.stroke();
+
+  const drawPec = (sy) => {
+    ctx.beginPath();
+    ctx.moveTo(r * 0.22, sy * r * 0.08);
+    ctx.lineTo(-r * 0.08, sy * r * 0.62);
+    ctx.lineTo(-r * 0.48, sy * r * 0.2);
+    ctx.closePath();
+    const pg = ctx.createLinearGradient(0, sy * r * 0.5, 0, 0);
+    pg.addColorStop(0, blueB);
+    pg.addColorStop(1, blueC);
+    ctx.fillStyle = pg;
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.45)";
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(160,210,255,0.25)";
+    ctx.lineWidth = 0.9;
+    ctx.stroke();
+  };
+  drawPec(-1);
+  drawPec(1);
+
+  ctx.fillStyle = "#2a3038";
+  ctx.beginPath();
+  ctx.moveTo(r * 1.02, -r * 0.12);
+  ctx.lineTo(r * 0.72, -r * 0.28);
+  ctx.quadraticCurveTo(r * 0.55, -r * 0.05, r * 0.78, r * 0.12);
+  ctx.lineTo(r * 1.02, r * 0.08);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = silver;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  ctx.fillStyle = "#121418";
+  ctx.beginPath();
+  ctx.ellipse(r * 0.62, -r * 0.16, r * 0.11, r * 0.088, -0.1, 0, Math.PI * 2);
+  ctx.fill();
+  const eyeGrad = ctx.createRadialGradient(r * 0.68, -r * 0.18, 0, r * 0.6, -r * 0.15, r * 0.095);
+  eyeGrad.addColorStop(0, "#ffffa0");
+  eyeGrad.addColorStop(0.25, "#ff5020");
+  eyeGrad.addColorStop(0.55, "#c01020");
+  eyeGrad.addColorStop(1, "#200408");
+  ctx.fillStyle = eyeGrad;
+  ctx.beginPath();
+  ctx.arc(r * 0.6, -r * 0.15, r * 0.048, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.beginPath();
+  ctx.arc(r * 0.64, -r * 0.17, r * 0.014, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.strokeStyle = silver;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(r * 0.88, r * 0.06);
+  ctx.lineTo(r * 1.05, r * 0.2);
+  ctx.moveTo(r * 0.88, -r * 0.06);
+  ctx.lineTo(r * 1.05, -r * 0.2);
+  ctx.stroke();
+
+  ctx.fillStyle = "rgba(255,120,60,0.55)";
+  ctx.beginPath();
+  ctx.ellipse(r * 0.92, 0, r * 0.045, r * 0.055, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "rgba(255,210,140,0.5)";
+  ctx.beginPath();
+  ctx.arc(r * 0.96, 0, r * 0.055, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = trim;
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+
+  if (!shielded) {
+    ctx.strokeStyle = "rgba(80,255,200,0.65)";
+    ctx.lineWidth = 2.8;
+    ctx.setLineDash([6, 8]);
+    ctx.beginPath();
+    ctx.ellipse(0, 0, r * 0.96, r * 0.56, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  ctx.restore();
 }
 
 function spawnMineExplosion(x, y, baseR) {
@@ -2124,6 +3062,7 @@ function drawMineExplosionsWorld() {
 }
 
 function updateMysterySpawns(dt) {
+  if (sectorBossActive()) return;
   const cap = getMysteryTimerSpawnCap();
   game.mysterySpawnTimer -= dt;
   if (game.mysterySpawnTimer > 0) return;
@@ -2159,35 +3098,92 @@ function updateHud() {
 }
 
 function drawEffectText() {
-  const effects = [];
-  if (game.immunityTimer > 0) effects.push(`Immunity ${game.immunityTimer.toFixed(1)}s`);
-  if (game.shield > 0) {
-    const capNote =
-      game.shieldScoreRegenUnlocked && game.shield < SHIELD_REGEN_CAP
-        ? ` (regen→${SHIELD_REGEN_CAP}%)`
-        : "";
-    effects.push(`Shield ${Math.ceil(game.shield)}%${capNote}`);
+  /** Top header already shows shield % — keep bottom strip to combat + upgrades only. */
+  const primary = [];
+  const secondary = [];
+
+  if (sectorBossActive() && game.sectorBoss.kind === "l1Fish") {
+    const b = game.sectorBoss;
+    primary.push(`Boss t${b.tier ?? 1} ${b.vulnerable ? "VULN" : "SHLD"}`);
   }
+  if (game.immunityTimer > 0) primary.push(`Immo ${game.immunityTimer.toFixed(0)}s`);
+
+  const wcap = game.weaponPowerMult > 1.001 ? `×${game.weaponPowerMult.toFixed(2)}` : "";
+  const wSeg = [];
   if (game.hasBlaster) {
-    const bl =
-      game.blasterTier >= 3 ? "Blaster x6" : game.blasterTier === 2 ? "Blaster x3" : "Blaster";
-    effects.push(`${bl} (hold F)`);
+    const n = game.blasterTier >= 3 ? 6 : game.blasterTier === 2 ? 3 : 1;
+    wSeg.push(`F×${n}`);
   }
-  if (game.hasSecondaryWeapon) effects.push("Secondary x2 (G)");
-  if (game.hasSmartMissiles) effects.push("Smart missiles");
-  if (game.enhancedShields) effects.push("Enhanced shields");
-  if (game.hasDeflector) effects.push("Deflector");
+  if (game.hasSecondaryWeapon) wSeg.push("G×2");
+  if (wSeg.length) primary.push(wSeg.join(" ") + (wcap ? ` ${wcap}` : ""));
+
+  const flat = game.weaponFlatBonus ?? 0;
+  const spdM = game.playerSpeedMult ?? 1;
+  if (flat > 0 || spdM > 1.001) {
+    const bits = [];
+    if (flat > 0) bits.push(`+${flat}dmg`);
+    if (spdM > 1.001) bits.push(`spd×${spdM.toFixed(2)}`);
+    primary.push(bits.join(" "));
+  }
+
+  if (game.hasSmartMissiles) secondary.push("Seek");
+  if (game.enhancedShields) secondary.push("Sh+");
+  if (game.hasDeflector) secondary.push("Defl");
   if (game.hasEnhancedDeflector) {
     const sec =
       game.enhancedDeflectorCooldown > 0 ? game.enhancedDeflectorCooldown : game.enhancedDeflectorBurstLeft;
-    effects.push(`Enhanced deflector ${sec.toFixed(1)}s`);
+    secondary.push(`Edef ${sec.toFixed(0)}s`);
   }
-  if (effects.length === 0) return;
+  if (game.hasAcceleratedReverse) secondary.push("Rev");
+  if (game.droneGuardsTimeRemaining > 0) secondary.push(`Wing ${game.droneGuardsTimeRemaining.toFixed(0)}s`);
+
+  if (primary.length === 0 && secondary.length === 0) return;
+
   ctx.save();
   ctx.textAlign = "left";
-  ctx.font = "bold 18px Trebuchet MS, sans-serif";
   ctx.fillStyle = "#d6f0ff";
-  ctx.fillText(effects.join("  |  "), 16, WORLD.height - 18);
+  const yCombat = WORLD.height - 14;
+  const yMods = WORLD.height - 34;
+  const sep = " · ";
+  if (primary.length) {
+    ctx.font = "bold 15px Trebuchet MS, sans-serif";
+    ctx.fillText(primary.join(sep), 16, yCombat);
+  }
+  if (secondary.length) {
+    ctx.font = "13px Trebuchet MS, sans-serif";
+    ctx.globalAlpha = 0.9;
+    ctx.fillText(secondary.join(sep), 16, primary.length ? yMods : yCombat);
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+/** Boss HP % — top-right of the playfield (see `sectorBoss`). */
+function drawBossHpCorner() {
+  const boss = game.sectorBoss;
+  if (!boss || boss.kind !== "l1Fish" || !game.started || game.gameOver) return;
+  const pct = clamp((100 * boss.hp) / Math.max(1, boss.maxHp), 0, 100);
+  const pctRounded = Math.max(0, Math.round(pct));
+  const vuln = boss.vulnerable;
+  const x = WORLD.width - 14;
+  const y = 12;
+  ctx.save();
+  ctx.font = "bold 21px Trebuchet MS, sans-serif";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "top";
+  const main = `Boss ${pctRounded}%`;
+  ctx.strokeStyle = "rgba(0,0,0,0.75)";
+  ctx.lineWidth = 3.5;
+  ctx.strokeText(main, x, y);
+  ctx.fillStyle = vuln ? "#8cffc8" : "#ffe9b0";
+  ctx.fillText(main, x, y);
+  ctx.font = "12px Trebuchet MS, sans-serif";
+  ctx.strokeStyle = "rgba(0,0,0,0.65)";
+  ctx.lineWidth = 2.5;
+  const sub = vuln ? "vulnerable" : "shielded";
+  ctx.strokeText(sub, x, y + 24);
+  ctx.fillStyle = vuln ? "rgba(190, 255, 220, 0.92)" : "rgba(255, 230, 190, 0.9)";
+  ctx.fillText(sub, x, y + 24);
   ctx.restore();
 }
 
@@ -2490,7 +3486,15 @@ function drawHostilesWorld() {
 function drawEnemyBulletsWorld() {
   ctx.save();
   for (const b of game.enemyBullets) {
-    ctx.fillStyle = b.kind === "turret" ? "#ff3d4d" : "#ff6eb4";
+    if (b.kind === "bossFish") {
+      const g = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, b.radius * 1.6);
+      g.addColorStop(0, "#fff8c8");
+      g.addColorStop(0.45, "#ff9a32");
+      g.addColorStop(1, "#c43810");
+      ctx.fillStyle = g;
+    } else {
+      ctx.fillStyle = b.kind === "turret" ? "#ff3d4d" : "#ff6eb4";
+    }
     ctx.beginPath();
     ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
     ctx.fill();
@@ -2527,6 +3531,7 @@ function drawMinesWorld() {
 
 /** Shipwreck-style ISS; `goalX` / `stationY` are world center (scroll with map). */
 function drawCheckpointStation() {
+  if (game.bossArenaTier != null) return;
   ensureIssStationImg();
   const sx = game.goalX;
   const sy = game.stationY;
@@ -2558,6 +3563,7 @@ function drawCheckpointStation() {
     game.started &&
     !game.gameOver &&
     !game.won &&
+    !sectorBossActive() &&
     playerInCheckpointRange()
   ) {
     ctx.strokeStyle = "rgba(120, 220, 255, 0.55)";
@@ -2571,51 +3577,80 @@ function drawCheckpointStation() {
   ctx.restore();
 }
 
-function drawShipThrusterWorld(p, bank) {
+/** `visualScale` 2 = double-size aft plume (accelerated reverse, hold left). */
+function drawThrusterPlume(p, bank, visualScale, mirrorX) {
+  const r = p.r * visualScale;
   const t = game.lastTs * 0.001;
-  const pressingRight = !!(KEY.KeyD || KEY.ArrowRight);
-  if (!pressingRight) return;
-  const speedT = clamp(Math.hypot(p.vx, p.vy) / MAX_SPEED, 0, 1);
+  const speedT = clamp(Math.hypot(p.vx, p.vy) / (MAX_SPEED * playerMoveSpeedScale()), 0, 1);
   const flameT = 0.8 + speedT * 0.35;
-  const baseLen = p.r * (0.7 + flameT * 0.85);
+  const baseLen = p.r * (0.7 + flameT * 0.85) * visualScale;
   const flicker = 1 + Math.sin(t * 28) * 0.16 + Math.cos(t * 17) * 0.07;
   const len = baseLen * flicker;
 
   ctx.save();
   ctx.translate(p.x, p.y);
   ctx.rotate(bank);
+  if (mirrorX) ctx.scale(-1, 1);
 
-  // Soft plume glow.
   ctx.globalCompositeOperation = "screen";
-  const plume = ctx.createRadialGradient(-p.r * 1.05, 0, p.r * 0.08, -p.r * 1.35, 0, p.r * 1.25);
+  const plume = ctx.createRadialGradient(-r * 1.05, 0, r * 0.08, -r * 1.35, 0, r * 1.25);
   plume.addColorStop(0, "rgba(255, 248, 208, 0.55)");
   plume.addColorStop(0.35, "rgba(255, 166, 86, 0.42)");
   plume.addColorStop(1, "rgba(255, 80, 24, 0)");
   ctx.fillStyle = plume;
   ctx.beginPath();
-  ctx.ellipse(-p.r * 1.2, 0, p.r * 1.05, p.r * 0.7, 0, 0, Math.PI * 2);
+  ctx.ellipse(-r * 1.2, 0, r * 1.05, r * 0.7, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  // Main thrust icon/flame.
   ctx.globalCompositeOperation = "source-over";
   ctx.fillStyle = "#ff8a3a";
   ctx.beginPath();
-  ctx.moveTo(-p.r * 0.9, 0);
-  ctx.lineTo(-p.r * 1.15, -p.r * 0.22);
-  ctx.lineTo(-p.r * (1.05 + len / p.r), 0);
-  ctx.lineTo(-p.r * 1.15, p.r * 0.22);
+  ctx.moveTo(-r * 0.9, 0);
+  ctx.lineTo(-r * 1.15, -r * 0.22);
+  ctx.lineTo(-r * (1.05 + len / r), 0);
+  ctx.lineTo(-r * 1.15, r * 0.22);
   ctx.closePath();
   ctx.fill();
 
   ctx.fillStyle = "#fff2ad";
   ctx.beginPath();
-  ctx.moveTo(-p.r * 0.98, 0);
-  ctx.lineTo(-p.r * 1.12, -p.r * 0.12);
-  ctx.lineTo(-p.r * (1 + len * 0.58 / p.r), 0);
-  ctx.lineTo(-p.r * 1.12, p.r * 0.12);
+  ctx.moveTo(-r * 0.98, 0);
+  ctx.lineTo(-r * 1.12, -r * 0.12);
+  ctx.lineTo(-r * (1 + (len * 0.58) / r), 0);
+  ctx.lineTo(-r * 1.12, r * 0.12);
   ctx.closePath();
   ctx.fill();
   ctx.restore();
+}
+
+function drawDroneGuardsWorld(p, bank, flash) {
+  if (game.droneGuardsTimeRemaining <= 0) return;
+  const img = getPlayerShipImage();
+  const opt = getShipSkinOption();
+  const gap = p.r * DRONE_GUARD_STRAFE_MULT;
+  const dr = p.r * DRONE_GUARD_R_MULT;
+  const ax = p.x - p.r * DRONE_GUARD_AFT_X_MULT;
+  for (const oy of [-gap, gap]) {
+    ctx.save();
+    ctx.translate(ax, p.y + oy);
+    if (img) {
+      ctx.rotate(RASTER_SHIP_ROTATION + bank);
+      ctx.globalAlpha = flash ? 0.4 : 0.86;
+      const base = Math.max(img.naturalWidth, img.naturalHeight);
+      const target = dr * 4.2 * (opt.rasterScale ?? 1);
+      const sc = target / base;
+      ctx.scale(sc, sc);
+      ctx.drawImage(img, -img.naturalWidth * 0.5, -img.naturalHeight * 0.5);
+    } else {
+      drawDefaultClassicShip(ctx, dr, flash, bank);
+    }
+    ctx.restore();
+  }
+}
+
+function drawShipThrusterWorld(p, bank) {
+  if (KEY.KeyD || KEY.ArrowRight) drawThrusterPlume(p, bank, 1, false);
+  if (game.hasAcceleratedReverse && (KEY.KeyA || KEY.ArrowLeft)) drawThrusterPlume(p, bank, 2, true);
 }
 
 /** Shield glow around the ship (color shifts with shield strength), plus immunity pulse. */
@@ -2704,9 +3739,23 @@ function drawMysteriesWorld() {
     ctx.arc(t.x, t.y, t.radius, 0, Math.PI * 2);
     ctx.fill();
     ctx.lineWidth = 2;
-    ctx.strokeStyle = t.kind === "brownDeflectorOrb" ? "#f0c080" : "#f2d6ff";
+    ctx.strokeStyle =
+      t.kind === "brownDeflectorOrb"
+        ? "#f0c080"
+        : t.kind === "weaponPowerOrb"
+          ? "#ffd060"
+          : t.kind === "reverseBoostOrb"
+            ? "#7af0d8"
+            : "#f2d6ff";
     ctx.stroke();
-    ctx.fillStyle = t.kind === "brownDeflectorOrb" ? "#ffe8c8" : "#fff4ab";
+    ctx.fillStyle =
+      t.kind === "brownDeflectorOrb"
+        ? "#ffe8c8"
+        : t.kind === "weaponPowerOrb"
+          ? "#fff0a8"
+          : t.kind === "reverseBoostOrb"
+            ? "#d8fff6"
+            : "#fff4ab";
     ctx.beginPath();
     ctx.arc(t.x, t.y, 3.2, 0, Math.PI * 2);
     ctx.fill();
@@ -2767,13 +3816,16 @@ function drawWorld() {
   ctx.restore();
 
   drawCheckpointStation();
+  drawSectorBossWorld();
 
   const p = game.player;
   const img = getPlayerShipImage();
   const opt = getShipSkinOption();
-  const bank = clamp(p.vy / MAX_SPEED, -1, 1) * 0.22;
+  const smv = playerMoveSpeedScale();
+  const bank = clamp(p.vy / (MAX_SPEED * VERT_MAX_SPEED_RATIO * smv), -1, 1) * 0.22;
   const flash = game.invuln > 0 && Math.floor(game.lastTs / 70) % 2 === 0;
 
+  drawDroneGuardsWorld(p, bank, flash);
   drawShipThrusterWorld(p, bank);
 
   ctx.save();
@@ -2932,6 +3984,26 @@ function applyCanvasSize() {
       game.player.vx *= sx;
       game.player.vy *= sy;
     }
+    const sb = game.sectorBoss;
+    if (sb && sb.kind === "l1Fish") {
+      sb.anchorX *= sx;
+      sb.baseY *= sy;
+      sb.x *= sx;
+      sb.y *= sy;
+      sb.hitR *= vScale;
+      sb.dashVx *= sx;
+      sb.dashVy *= sy;
+    }
+  }
+}
+
+function applyQueryCheatsFromSettings() {
+  const list = game.settings.queryCheats;
+  if (!list || list.length === 0) return;
+  for (const raw of list) {
+    const c = String(raw).toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (c === "raptor") applyCheatRaptor();
+    else if (c === "dariusii" || c === "darius2") applyCheatDariusIi();
   }
 }
 
@@ -2939,7 +4011,18 @@ function resetGame() {
   game.settings.startLevel = getStartLevel();
   game.level = game.settings.startLevel;
   applyPlayfieldLayout();
-  buildLevel(game.level);
+  game.pendingBossAfterStation = false;
+  game.advanceLevelAfterBoss = false;
+  game.deferredBossInitTier = null;
+  game.sectorBoss = null;
+
+  const boot = game.settings.bootBossTier;
+  if (boot != null && boot >= 1) {
+    buildBossArena(clamp(Math.floor(boot), 1, 99));
+  } else {
+    buildLevel(game.level);
+  }
+
   const pr = 13 * ((WORLD.width / DEFAULT_CANVAS_WIDTH + WORLD.height / DEFAULT_CANVAS_HEIGHT) * 0.5);
   game.player = {
     x: game.spawnX,
@@ -2959,6 +4042,9 @@ function resetGame() {
   game.blasterCooldown = 0;
   game.hasSecondaryWeapon = false;
   game.secondaryCooldown = 0;
+  game.weaponPowerMult = 1;
+  game.weaponFlatBonus = 0;
+  game.playerSpeedMult = 1;
   game.bullets = [];
   game.hasSmartMissiles = false;
   game.smartMissileFireAcc = 0;
@@ -2970,6 +4056,10 @@ function resetGame() {
   game.enhancedDeflectorBurstMax = ENHANCED_DEFLECTOR_BURST_START;
   game.enhancedDeflectorBurstLeft = 0;
   game.enhancedDeflectorCooldown = 0;
+  game.hasAcceleratedReverse = false;
+  game.droneGuardsTimeRemaining = 0;
+  game.droneBlasterHalfToggle = false;
+  game.droneSecondaryHalfToggle = false;
   game.gameOver = false;
   game.won = false;
   game.invuln = 0;
@@ -2978,7 +4068,13 @@ function resetGame() {
   game.started = false;
   game.cameraX = 0;
   game.lastTs = performance.now();
-  statusEl.textContent = `Sector ${game.level} — click to start.`;
+  if (boot != null && boot >= 1) {
+    game.deferredBossInitTier = clamp(Math.floor(boot), 1, 99);
+    statusEl.textContent = `Boss ${game.deferredBossInitTier} arena — click to start.`;
+  } else {
+    statusEl.textContent = `Sector ${game.level} — click to start.`;
+  }
+  applyQueryCheatsFromSettings();
   updateHud();
 }
 
@@ -2991,6 +4087,33 @@ function togglePause() {
 
 function resumeFromWin() {
   if (!game.won) return;
+  if (game.advanceLevelAfterBoss) {
+    game.advanceLevelAfterBoss = false;
+    game.won = false;
+    game.paused = false;
+    game.level += 1;
+    game.score += 60;
+    buildLevel(game.level);
+    const p = game.player;
+    p.x = game.spawnX;
+    p.y = game.spawnY;
+    p.vx = 0;
+    p.vy = 0;
+    game.invuln = 1.2;
+    game.lastTs = performance.now();
+    statusEl.textContent = `Sector ${game.level} — go!`;
+    updateHud();
+    return;
+  }
+  if (game.pendingBossAfterStation) {
+    game.pendingBossAfterStation = false;
+    game.won = false;
+    game.paused = false;
+    enterBossArena(getBossTierForSector(game.level));
+    game.lastTs = performance.now();
+    updateHud();
+    return;
+  }
   game.level += 1;
   game.won = false;
   game.paused = false;
@@ -3058,15 +4181,18 @@ function frame(ts) {
     updateHostileStationSpawns(dt);
     updateHostileStations(dt);
     updateEnemyBullets(dt);
+    updateSectorBoss(dt);
     updatePlayer(dt);
     updateMines(dt);
     updateSmartMissiles(dt);
     handleSmartMissileHits();
     updateBullets(dt);
+    handlePlayerBulletVsEnemyBulletHits();
     handleBulletMineHits();
     handleBulletMeteorHits();
     handleBulletHostileHits();
     handleBulletStationHits();
+    handleBulletSectorBossHits();
     updateOverlays(dt);
     updateHud();
     const dScore = game.score - game.prevScoreForShieldRegen;
@@ -3131,8 +4257,10 @@ function frame(ts) {
     );
     ctx.font = "16px Trebuchet MS, sans-serif";
     ctx.fillStyle = "#d4e7ff";
-    ctx.fillText("Cheat (start/pause): type DARIUSII", WORLD.width * 0.5, WORLD.height * 0.64);
+    ctx.fillText("Cheats (start/pause): DARIUSII  ·  RAPTOR (drone wingmen)", WORLD.width * 0.5, WORLD.height * 0.64);
   }
+
+  drawBossHpCorner();
 
   requestAnimationFrame(frame);
 }
@@ -3162,6 +4290,10 @@ window.addEventListener("keydown", (e) => {
       const compact = cheatBuffer.replace(/[^A-Z0-9]/g, "");
       if (compact.endsWith("DARIUSII") || compact.endsWith("DARIUS2")) {
         applyCheatDariusIi();
+        cheatBuffer = "";
+      }
+      if (compact.endsWith("RAPTOR")) {
+        applyCheatRaptor();
         cheatBuffer = "";
       }
     }
@@ -3209,7 +4341,14 @@ window.addEventListener("click", (e) => {
     game.started = true;
     game.paused = false;
     game.lastTs = performance.now();
-    statusEl.textContent = `Sector ${game.level} — good luck.`;
+    if (game.deferredBossInitTier != null) {
+      initBossForTier(game.deferredBossInitTier);
+      game.deferredBossInitTier = null;
+      addOverlay(`Boss tier ${game.sectorBoss?.tier ?? "?"}`, "#7ec8ff");
+      statusEl.textContent = "Boss arena — good luck.";
+    } else {
+      statusEl.textContent = `Sector ${game.level} — good luck.`;
+    }
     return;
   }
   if (game.won) resumeFromWin();
@@ -3312,6 +4451,23 @@ function applyModeFromQueryString() {
       const n = Number.parseInt(levelParam, 10);
       if (!Number.isNaN(n)) game.settings.startLevel = clamp(n, 1, 99);
     }
+    const bossParam = params.get("boss");
+    if (bossParam !== null && bossParam !== "") {
+      const bn = Number.parseInt(bossParam, 10);
+      if (!Number.isNaN(bn) && bn >= 1) game.settings.bootBossTier = clamp(bn, 1, 99);
+      else game.settings.bootBossTier = null;
+    } else {
+      game.settings.bootBossTier = null;
+    }
+    const cheatParts = [];
+    for (const v of params.getAll("cheat")) {
+      for (const part of v.split(/[,+]/)) cheatParts.push(part);
+    }
+    const cheatsJoined = params.get("cheats");
+    if (cheatsJoined) cheatParts.push(...cheatsJoined.split(/[,+]/));
+    game.settings.queryCheats = cheatParts
+      .map((s) => s.trim().toLowerCase().replace(/[^a-z0-9]/g, ""))
+      .filter(Boolean);
     const shipParam = params.get("ship");
     if (
       shipParam === "serenity" ||
@@ -3329,6 +4485,15 @@ function applyModeFromQueryString() {
 applyModeFromQueryString();
 normalizeShipSkin();
 initShipSkinSelect();
+if (sectorBossFightsChkEl) {
+  sectorBossFightsChkEl.checked = game.settings.sectorBossFights;
+  sectorBossFightsChkEl.addEventListener("change", () => {
+    game.settings.sectorBossFights = sectorBossFightsChkEl.checked;
+    statusEl.textContent = game.settings.sectorBossFights
+      ? "Boss arenas on — dock first, then boss, then next sector."
+      : "Boss arenas off — dock goes straight to the next sector.";
+  });
+}
 if (startLevelInputEl) startLevelInputEl.value = String(game.settings.startLevel);
 applyCanvasSize();
 resetGame();
